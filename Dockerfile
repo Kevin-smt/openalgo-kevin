@@ -16,9 +16,36 @@ RUN pip install --no-cache-dir uv && \
 # ------------------------------ Frontend Builder Stage --------------------- #
 FROM node:20-bullseye-slim AS frontend-builder
 WORKDIR /app
+ARG GIT_COMMIT_SHA=unknown
+ARG GIT_BRANCH=unknown
+ARG GIT_REPO=unknown
+ARG SOURCE_COMMIT=unknown
+ARG RAILWAY_GIT_COMMIT_SHA=unknown
+ARG RAILWAY_GIT_BRANCH=unknown
+ARG RAILWAY_REPO_SLUG=unknown
 COPY frontend/package*.json ./frontend/
 RUN cd frontend && npm install
 COPY frontend/ ./frontend/
+RUN printf '%s\n' \
+    '=== OpenAlgo Frontend Build Diagnostics ===' \
+    "WORKDIR=$(pwd)" \
+    "ARG GIT_COMMIT_SHA=${GIT_COMMIT_SHA}" \
+    "ARG GIT_BRANCH=${GIT_BRANCH}" \
+    "ARG GIT_REPO=${GIT_REPO}" \
+    "ARG SOURCE_COMMIT=${SOURCE_COMMIT}" \
+    "ARG RAILWAY_GIT_COMMIT_SHA=${RAILWAY_GIT_COMMIT_SHA}" \
+    "ARG RAILWAY_GIT_BRANCH=${RAILWAY_GIT_BRANCH}" \
+    "ARG RAILWAY_REPO_SLUG=${RAILWAY_REPO_SLUG}" \
+    "package.json name=$(node -p \"require('./frontend/package.json').name\")" \
+    "frontend/src/lib files:" && \
+    find frontend/src/lib -maxdepth 2 -type f | sort && \
+    printf '%s\n' \
+    "frontend/src/lib/utils.ts sha256:" && sha256sum frontend/src/lib/utils.ts && \
+    printf '%s\n' \
+    "frontend/src/lib/flow/constants.ts sha256:" && sha256sum frontend/src/lib/flow/constants.ts && \
+    printf '%s\n' \
+    "frontend/src/lib/MarketDataManager.ts sha256:" && sha256sum frontend/src/lib/MarketDataManager.ts && \
+    printf '%s\n' '=== End Diagnostics ==='
 RUN cd frontend && npm run build
 
 # --------------------------------------------------------------------------- #
