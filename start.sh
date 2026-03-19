@@ -8,6 +8,13 @@ echo "[OpenAlgo] Starting up..."
 # Determine writable .env location
 ENV_FILE="/app/.env"
 
+# Railway exposes the public HTTP domain as RAILWAY_PUBLIC_DOMAIN.
+# Prefer an explicit HOST_SERVER override, then fall back to Railway, and
+# finally leave the app to fail with a clear error if neither is present.
+if [ -z "$HOST_SERVER" ] && [ -n "$RAILWAY_PUBLIC_DOMAIN" ]; then
+    HOST_SERVER="https://${RAILWAY_PUBLIC_DOMAIN}"
+fi
+
 # Check if .env exists, is readable, and has content (not empty)
 if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ] && [ -s "$ENV_FILE" ]; then
     echo "[OpenAlgo] Using existing .env file"
@@ -18,7 +25,7 @@ else
     if [ -n "$HOST_SERVER" ]; then
         echo "[OpenAlgo] Environment variables detected. Generating .env file..."
         
-        # Extract domain without https:// for WebSocket URL
+        # Extract domain without https:// for browser-facing URLs
         HOST_DOMAIN="${HOST_SERVER#https://}"
         HOST_DOMAIN="${HOST_DOMAIN#http://}"
         
@@ -75,7 +82,10 @@ FLASK_ENV = '${FLASK_ENV:-production}'
 # WebSocket Configuration
 WEBSOCKET_HOST = '0.0.0.0'
 WEBSOCKET_PORT = '${WEBSOCKET_PORT:-8765}'
-WEBSOCKET_URL = '${WEBSOCKET_URL:-wss://${HOST_DOMAIN}/ws}'
+# Default to the local websocket proxy. On Railway, set WEBSOCKET_URL to your
+# TCP proxy endpoint if you want browser-based websocket tools to connect.
+WEBSOCKET_URL = '${WEBSOCKET_URL:-ws://127.0.0.1:${WEBSOCKET_PORT:-8765}}'
+WEBSOCKET_PUBLIC_URL = '${WEBSOCKET_PUBLIC_URL:-}'
 
 # ZeroMQ Configuration
 ZMQ_HOST = '0.0.0.0'

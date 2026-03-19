@@ -468,6 +468,13 @@ def load_and_check_env_variables() -> None:
         print("Example: WEBSOCKET_URL='ws://localhost:8765'")
         sys.exit(1)
 
+    # Validate optional public websocket URL format when present
+    websocket_public_url = os.getenv("WEBSOCKET_PUBLIC_URL", "").strip()
+    if websocket_public_url and not websocket_public_url.startswith("ws://") and not websocket_public_url.startswith("wss://"):
+        print("\nError: WEBSOCKET_PUBLIC_URL must start with 'ws://' or 'wss://' if set")
+        print("Example: WEBSOCKET_PUBLIC_URL='wss://proxy.example.com:443'")
+        sys.exit(1)
+
     # Validate logging configuration
     log_to_file = os.getenv("LOG_TO_FILE", "").lower()
     if log_to_file not in ["true", "false"]:

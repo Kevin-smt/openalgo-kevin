@@ -3,6 +3,8 @@ Example blueprint showing how to use the WebSocket service layer
 for internal UI components without authentication overhead.
 """
 
+from urllib.parse import urlparse
+
 from flask import Blueprint, current_app, jsonify, render_template, request, session
 from flask_socketio import emit, join_room, leave_room
 
@@ -196,12 +198,27 @@ def api_get_websocket_config():
 
     from flask import request
 
-    websocket_url = os.getenv("WEBSOCKET_URL", "ws://localhost:8765")
+    websocket_url = (
+        os.getenv("WEBSOCKET_PUBLIC_URL")
+        or os.getenv("WEBSOCKET_URL", "ws://localhost:8765")
+    )
 
-    # If the current request is HTTPS and the WebSocket URL is WS, upgrade to WSS
+    # Only auto-upgrade public websocket endpoints to WSS. Internal hosts such
+    # as localhost, 127.0.0.1, and 0.0.0.0 should remain untouched because the
+    # browser cannot reach them from a cloud deployment.
     if request.is_secure and websocket_url.startswith("ws://"):
-        websocket_url = websocket_url.replace("ws://", "wss://")
-        logger.info(f"Upgraded WebSocket URL to secure: {websocket_url}")
+        parsed_url = urlparse(websocket_url)
+        hostname = (parsed_url.hostname or "").lower()
+        is_internal_host = hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+        if not is_internal_host:
+            websocket_url = websocket_url.replace("ws://", "wss://", 1)
+            logger.info(f"Upgraded WebSocket URL to secure: {websocket_url}")
+        else:
+            logger.warning(
+                "Using an internal websocket URL in a secure session; "
+                "set WEBSOCKET_PUBLIC_URL or update WEBSOCKET_URL for browser access."
+            )
 
     return jsonify(
         {
@@ -209,6 +226,7 @@ def api_get_websocket_config():
             "websocket_url": websocket_url,
             "is_secure": request.is_secure,
             "original_url": os.getenv("WEBSOCKET_URL", "ws://localhost:8765"),
+            "public_websocket_url": os.getenv("WEBSOCKET_PUBLIC_URL", ""),
         }
     ), 200
 
