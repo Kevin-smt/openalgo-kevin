@@ -56,29 +56,40 @@ def delete_symtoken_table():
 
 
 def copy_from_dataframe(df):
-    logger.info("Performing Bulk Insert")
-    # Convert DataFrame to a list of dictionaries
-    data_dict = df.to_dict(orient="records")
+    logger.info("Performing Chunked Insert ---")
+    chunk_size = int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "200"))
 
-    # Retrieve existing tokens to filter them out from the insert
-    existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
-
-    # Filter out data_dict entries with tokens that already exist
-    filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
-
-    # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
-            db_session.commit()
-            logger.info(
-                f"Bulk insert completed successfully with {len(filtered_data_dict)} new records."
-            )
-        else:
+        total_rows = len(df)
+        if total_rows == 0:
             logger.info("No new records to insert.")
+            return
+
+        logger.info(
+            f"Starting chunked insert of {total_rows} records in chunks of {chunk_size}"
+        )
+
+        inserted = 0
+        for start in range(0, total_rows, chunk_size):
+            end = min(start + chunk_size, total_rows)
+            chunk_df = df.iloc[start:end]
+            chunk_records = chunk_df.to_dict(orient="records")
+
+            if not chunk_records:
+                continue
+
+            db_session.bulk_insert_mappings(SymToken, chunk_records)
+            db_session.commit()
+            inserted += len(chunk_records)
+
+            if inserted % (chunk_size * 10) == 0 or inserted == total_rows:
+                logger.info(f"Inserted {inserted}/{total_rows} records")
+
+        logger.info(f"Chunked insert completed successfully with {inserted} records.")
     except Exception as e:
-        logger.error(f"Error during bulk insert: {e}")
         db_session.rollback()
+        logger.error(f"Error during chunked insert: {e}")
+        raise
 
 
 def download_json_angel_data(url, output_path):
