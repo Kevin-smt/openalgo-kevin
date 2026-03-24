@@ -19,11 +19,29 @@ Usage:
         restore_all_caches()
 """
 
+import os
 import time
 
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def should_restore_symbol_cache() -> bool:
+    """
+    Decide whether the startup process should load the full symbol cache.
+
+    Default behavior:
+    - production: disabled
+    - non-production: enabled
+
+    Can be overridden with ENABLE_SYMBOL_CACHE_LOAD.
+    """
+    flag = os.getenv("ENABLE_SYMBOL_CACHE_LOAD")
+    if flag is not None:
+        return flag.lower() in ("1", "true", "yes", "on")
+
+    return os.getenv("FLASK_ENV", "").lower() != "production"
 
 
 def restore_symbol_cache() -> dict:
@@ -165,7 +183,7 @@ def restore_auth_cache() -> dict:
     return result
 
 
-def restore_all_caches() -> dict:
+def restore_all_caches(load_symbol_cache: bool | None = None) -> dict:
     """
     Restore all caches from database on application startup.
 
@@ -188,8 +206,19 @@ def restore_all_caches() -> dict:
     # Restore auth cache first (needed to determine broker for symbols)
     result["auth_cache"] = restore_auth_cache()
 
-    # Restore symbol cache
-    result["symbol_cache"] = restore_symbol_cache()
+    if load_symbol_cache is None:
+        load_symbol_cache = should_restore_symbol_cache()
+
+    if load_symbol_cache:
+        result["symbol_cache"] = restore_symbol_cache()
+    else:
+        result["symbol_cache"] = {
+            "success": False,
+            "symbols_loaded": 0,
+            "broker": None,
+            "time_ms": 0,
+            "error": "Symbol cache restoration disabled by configuration",
+        }
 
     # Calculate totals
     result["total_time_ms"] = (time.time() - total_start) * 1000

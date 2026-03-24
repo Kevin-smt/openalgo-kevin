@@ -166,7 +166,17 @@ def force_master_contract_download():
     """Force a fresh master contract download regardless of smart download logic"""
     try:
         broker = session.get("broker")
+        logger.info(
+            "Force master contract download requested: broker=%s user=%s path=%s",
+            broker,
+            session.get("user"),
+            request.path,
+        )
         if not broker:
+            logger.warning(
+                "Force master contract download rejected: no broker in session: path=%s",
+                request.path,
+            )
             return jsonify({"status": "error", "message": "No broker session found"}), 401
 
         # Get request body for force flag
@@ -187,6 +197,12 @@ def force_master_contract_download():
         init_broker_status(broker)
         thread = Thread(target=async_master_contract_download, args=(broker,), daemon=True)
         thread.start()
+
+        logger.info(
+            "Force master contract download thread started: broker=%s force=%s",
+            broker,
+            force,
+        )
 
         return jsonify({
             "status": "success",
