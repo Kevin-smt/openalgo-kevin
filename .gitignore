@@ -62,6 +62,11 @@ cover/
 # Django stuff:
 *.log
 local_settings.py
+*.db
+/db/*.db-wal
+/db/*.db-shm
+/db/*.db-journal
+/db
 db.sqlite3
 db.sqlite3-journal
 
