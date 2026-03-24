@@ -3,12 +3,28 @@ Master Contract Cache Hook
 Automatically loads symbols into memory cache after successful master contract download
 """
 
+import os
 import time
 
 from extensions import socketio
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def should_load_symbol_cache() -> bool:
+    """
+    Decide whether master-contract downloads should populate the in-memory
+    symbol cache.
+
+    This is intentionally disabled by default in production because the full
+    symbol set can be large enough to trigger OOM kills on small instances.
+    """
+    flag = os.getenv("ENABLE_SYMBOL_CACHE_LOAD")
+    if flag is not None:
+        return flag.lower() in ("1", "true", "yes", "on")
+
+    return os.getenv("FLASK_ENV", "").lower() != "production"
 
 
 def load_symbols_to_cache(broker: str) -> bool:
@@ -23,6 +39,14 @@ def load_symbols_to_cache(broker: str) -> bool:
         bool: True if cache loaded successfully, False otherwise
     """
     try:
+        if not should_load_symbol_cache():
+            logger.info(
+                "Skipping in-memory symbol cache load for broker %s because "
+                "ENABLE_SYMBOL_CACHE_LOAD is disabled",
+                broker,
+            )
+            return True
+
         logger.info(f"Starting cache load for broker: {broker}")
         start_time = time.time()
 

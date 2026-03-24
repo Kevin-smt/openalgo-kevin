@@ -200,7 +200,10 @@ def check_session_validity(f):
             if is_ajax:
                 # Return JSON response for AJAX requests instead of redirect
                 # This prevents consuming rate limits on the login endpoint
-                logger.info("Invalid session detected - returning 401 for AJAX request")
+                logger.info(
+                    "Invalid session detected - returning 401 for AJAX request: path=%s",
+                    request.path,
+                )
                 return jsonify(
                     {
                         "status": "error",
@@ -209,7 +212,10 @@ def check_session_validity(f):
                     }
                 ), 401
 
-            logger.info("Invalid session detected - redirecting to login")
+            logger.info(
+                "Invalid session detected - redirecting to login: path=%s",
+                request.path,
+            )
             return redirect(url_for("auth.login"))
         logger.debug("Session validated successfully")
         return f(*args, **kwargs)
