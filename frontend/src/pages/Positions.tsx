@@ -167,7 +167,7 @@ export default function Positions() {
     enabled: positions.length > 0,
     useMultiQuotesFallback: true,
     staleThreshold: 5000,
-    multiQuotesRefreshInterval: 1000,
+    multiQuotesRefreshInterval: 30000,
     pauseWhenHidden: true,
   })
 
@@ -235,7 +235,7 @@ export default function Positions() {
     lastFetchRef.current = Date.now()
 
     // Reduce polling interval when live (WebSocket connected AND market open)
-    const intervalMs = isLive ? 1000 : 1000
+    const intervalMs = isLive ? 30000 : 10000
     const interval = setInterval(() => {
       fetchPositions()
       lastFetchRef.current = Date.now()

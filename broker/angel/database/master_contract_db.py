@@ -57,7 +57,7 @@ def delete_symtoken_table():
 
 def copy_from_dataframe(df):
     logger.info("Performing Chunked Insert ---")
-    chunk_size = int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "200"))
+    chunk_size = int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "1000"))  # Default to 1000 if not set
 
     try:
         total_rows = len(df)
