@@ -31,7 +31,7 @@ export function Footer({ className }: FooterProps) {
       <div className="container mx-auto px-4 py-6">
         <div className="flex flex-col md:flex-row items-center justify-center gap-2 md:gap-4 text-sm text-muted-foreground">
           <div className="flex items-center gap-2">
-            <span>Copyright 2026 - SMT - 25.03.2026.1</span>
+            <span>Copyright 2026 - SMT - 25.03.2026.2</span>
             <span className="hidden md:inline">|</span>
             <a
               href="https://www.openalgo.in"
