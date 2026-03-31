@@ -3,10 +3,11 @@ from datetime import datetime
 
 import httpx
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from utils.database_config import bulk_insert_mappings_chunked, create_engine_from_env
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -21,7 +22,7 @@ client = httpx.Client(timeout=30.0)
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
-engine = create_engine(DATABASE_URL)
+engine = create_engine_from_env("DATABASE_URL", default_prefix="DB")
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -50,12 +51,6 @@ class SymToken(Base):
 def init_db():
     """Initialize the database and create tables"""
     logger.info("Initializing Master Contract DB")
-
-    # Create database directory if it doesn't exist
-    db_path = os.path.dirname(DATABASE_URL.replace("sqlite:///", ""))
-    if db_path and not os.path.exists(db_path):
-        os.makedirs(db_path)
-
     Base.metadata.create_all(bind=engine)
 
 
@@ -72,30 +67,23 @@ def copy_from_dataframe(df):
 
     # Retrieve existing tokens to filter them out from the insert
     existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
     # Filter out data_dict entries with tokens that already exist
     filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
-            db_session.commit()
-            logger.info(
-                f"Bulk insert completed successfully with {len(filtered_data_dict)} new records."
-            )
-        else:
-            logger.info("No new records to insert.")
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "500")),
+            logger=logger,
+            label="Master contract",
+        )
     except Exception as e:
-        logger.error(f"Error during bulk insert: {e}")
-        db_session.rollback()
-
-
-# Define Tradejini API endpoints
-TRADEJINI_BASE_URL = "https://api.tradejini.com/v2"
-SCRIP_GROUPS_URL = f"{TRADEJINI_BASE_URL}/api/mkt-data/scrips/symbol-store"
-SCRIP_DATA_URL = f"{TRADEJINI_BASE_URL}/api/mkt-data/scrips/symbol-store/{{group}}"
-
+        logger.exception(f"Error during bulk insert: {e}")
+        raise
 
 def get_scrip_groups():
     """Fetch available scrip groups from Tradejini API"""

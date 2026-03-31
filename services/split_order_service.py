@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
+from database.trading_db import _resolve_ledger_user_id, mirror_live_order
 from events import AnalyzerErrorEvent, OrderFailedEvent, SplitCompletedEvent
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
@@ -92,6 +93,8 @@ def place_single_order(
     auth_token: str,
     order_num: int,
     total_orders: int,
+    api_key: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Place a single order (no per-order event emission - summary event emitted at end)
@@ -112,6 +115,24 @@ def place_single_order(
 
         if res.status == 200:
             # No per-order event emission - a summary event is emitted at the end of all orders
+            mirror_live_order(
+                order_data=order_data,
+                broker=broker_module.__name__.split(".")[1] if hasattr(broker_module, "__name__") else "",
+                api_key=api_key,
+                broker_order_id=str(order_id),
+                order_status="open",
+                broker_response=response_data if isinstance(response_data, dict) else {"status": "success"},
+                user_id=user_id,
+                api_source="splitorder",
+            )
+            try:
+                from services.trading_sync_service import sync_live_trading_state
+
+                sync_live_trading_state(api_key, reason="splitorder")
+            except Exception as exc:
+                logger.warning(
+                    f"[LEDGER DEBUG] live trading sync after splitorder failed: {exc}"
+                )
             return {
                 "order_num": order_num,
                 "quantity": int(order_data["quantity"]),
@@ -124,6 +145,25 @@ def place_single_order(
                 if isinstance(response_data, dict)
                 else "Failed to place order"
             )
+            mirror_live_order(
+                order_data=order_data,
+                broker=broker_module.__name__.split(".")[1] if hasattr(broker_module, "__name__") else "",
+                api_key=api_key,
+                broker_order_id=str(response_data.get("orderid")) if isinstance(response_data, dict) and response_data.get("orderid") else None,
+                order_status="rejected",
+                broker_response=response_data if isinstance(response_data, dict) else {"status": "error", "message": message},
+                rejection_reason=message,
+                user_id=user_id,
+                api_source="splitorder",
+            )
+            try:
+                from services.trading_sync_service import sync_live_trading_state
+
+                sync_live_trading_state(api_key, reason="splitorder_rejected")
+            except Exception as exc:
+                logger.warning(
+                    f"[LEDGER DEBUG] live trading sync after splitorder rejection failed: {exc}"
+                )
             return {
                 "order_num": order_num,
                 "quantity": int(order_data["quantity"]),
@@ -162,6 +202,9 @@ def split_order_with_auth(
     split_request_data = copy.deepcopy(original_data)
     if "apikey" in split_request_data:
         split_request_data.pop("apikey", None)
+
+    api_key = original_data.get("apikey")
+    user_id = _resolve_ledger_user_id(api_key=api_key)
 
     # Validate quantities
     try:
@@ -349,7 +392,15 @@ def split_order_with_auth(
             time.sleep(order_delay)  # Rate limit delay between orders
         order_data = copy.deepcopy(split_data)
         order_data["quantity"] = str(split_size)
-        result = place_single_order(order_data, broker_module, auth_token, i + 1, total_orders)
+        result = place_single_order(
+            order_data,
+            broker_module,
+            auth_token,
+            i + 1,
+            total_orders,
+            api_key,
+            user_id,
+        )
         results.append(result)
 
     # Place remaining quantity order if any
@@ -359,7 +410,13 @@ def split_order_with_auth(
         order_data = copy.deepcopy(split_data)
         order_data["quantity"] = str(remaining_qty)
         result = place_single_order(
-            order_data, broker_module, auth_token, total_orders, total_orders
+            order_data,
+            broker_module,
+            auth_token,
+            total_orders,
+            total_orders,
+            api_key,
+            user_id,
         )
         results.append(result)
 

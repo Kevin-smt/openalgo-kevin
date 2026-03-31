@@ -3,6 +3,7 @@ import traceback
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
+from database.trading_db import _resolve_ledger_user_id, update_order_status
 from utils.logging import get_logger
 
 # Initialize logger
@@ -103,7 +104,10 @@ def import_broker_module(broker_name: str) -> dict[str, Any] | None:
 
 
 def get_orderbook_with_auth(
-    auth_token: str, broker: str, original_data: dict[str, Any] = None
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any] = None,
+    user_id: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get order book details using provided auth token.
@@ -166,6 +170,53 @@ def get_orderbook_with_auth(
         # Format numeric values to 2 decimal places
         formatted_orders = format_order_data(order_data)
         formatted_stats = format_statistics(order_stats)
+        logger.info(
+            "[LEDGER DEBUG] orderbook fetch complete: broker=%s orders=%s api_key_present=%s user_id=%s",
+            broker,
+            len(formatted_orders) if isinstance(formatted_orders, list) else "n/a",
+            bool(original_data.get("apikey") if original_data else None),
+            user_id,
+        )
+
+        try:
+            api_key = original_data.get("apikey") if original_data else None
+            ledger_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
+            logger.info(
+                "[LEDGER DEBUG] orderbook mirror start: resolved_user_id=%s broker=%s",
+                ledger_user_id,
+                broker,
+            )
+
+            if ledger_user_id:
+                for order in formatted_orders:
+                    broker_order_id = (
+                        order.get("broker_order_id")
+                        or order.get("orderid")
+                        or order.get("order_id")
+                    )
+                    if not broker_order_id:
+                        continue
+                    update_order_status(
+                        broker_order_id=str(broker_order_id),
+                        status=order.get("order_status") or order.get("status") or "open",
+                        filled_qty=order.get("filled_quantity")
+                        or order.get("filledqty")
+                        or order.get("traded_quantity")
+                        or order.get("tradedqty"),
+                        avg_price=order.get("average_price") or order.get("avg_price"),
+                        rejection_reason=order.get("rejection_reason"),
+                        broker=broker,
+                        user_id=ledger_user_id,
+                    )
+                    logger.info(
+                        "[LEDGER DEBUG] order status mirror updated: user=%s broker=%s broker_order_id=%s status=%s",
+                        ledger_user_id,
+                        broker,
+                        broker_order_id,
+                        order.get("order_status") or order.get("status") or "open",
+                    )
+        except Exception as exc:
+            logger.warning(f"Orderbook mirror sync failed (non-critical): {exc}")
 
         return (
             True,
@@ -182,7 +233,10 @@ def get_orderbook_with_auth(
 
 
 def get_orderbook(
-    api_key: str | None = None, auth_token: str | None = None, broker: str | None = None
+    api_key: str | None = None,
+    auth_token: str | None = None,
+    broker: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get order book details.
@@ -205,11 +259,11 @@ def get_orderbook(
         if AUTH_TOKEN is None:
             return False, {"status": "error", "message": "Invalid openalgo apikey"}, 403
         original_data = {"apikey": api_key}
-        return get_orderbook_with_auth(AUTH_TOKEN, broker_name, original_data)
+        return get_orderbook_with_auth(AUTH_TOKEN, broker_name, original_data, user_id=user_id)
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return get_orderbook_with_auth(auth_token, broker, None)
+        return get_orderbook_with_auth(auth_token, broker, None, user_id=user_id)
 
     # Case 3: Invalid parameters
     else:

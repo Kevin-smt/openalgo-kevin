@@ -24,6 +24,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { showToast } from '@/utils/toast'
+import { formatIstTime } from '@/utils/time'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -99,12 +100,7 @@ function formatVolume(volume: number): string {
 
 function formatTime(timestamp?: string): string {
   if (!timestamp) return '--:--:--'
-  return new Date(timestamp).toLocaleTimeString('en-IN', {
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
+  return formatIstTime(timestamp)
 }
 
 // Glowing status indicator

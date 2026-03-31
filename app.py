@@ -183,7 +183,7 @@ from database.flow_db import init_db as ensure_flow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
-from database.sandbox_db import init_db as ensure_sandbox_tables_exists
+from database.sandbox_db import init_sandbox_db as ensure_sandbox_tables_exists
 from database.settings_db import init_db as ensure_settings_tables_exists
 from database.strategy_db import init_db as ensure_strategy_tables_exists
 from database.symbol import init_db as ensure_master_contract_tables_exists
@@ -561,6 +561,16 @@ def setup_environment(app):
     # Event to signal when DB init is complete (cache restoration waits on this)
     app.db_ready = threading.Event()
 
+    # Sandbox mode depends on these tables immediately during startup.
+    # Initialize sandbox schema synchronously so the execution engine cannot race
+    # ahead of table creation and hit UndefinedTable errors.
+    try:
+        with app.app_context():
+            ensure_sandbox_tables_exists()
+            logger.debug("Sandbox DB initialized synchronously before background startup")
+    except Exception as e:
+        logger.exception(f"Failed to initialize Sandbox DB synchronously: {e}")
+
     def _init_databases_and_schedulers():
         with app.app_context():
             import time
@@ -569,6 +579,7 @@ def setup_environment(app):
             from database.chart_prefs_db import ensure_chart_prefs_tables_exists
             from database.market_calendar_db import ensure_market_calendar_tables_exists
             from database.qty_freeze_db import ensure_qty_freeze_tables_exists
+            from database.trading_db import ensure_trading_tables_exists
 
             db_init_functions = [
                 ("Auth DB", ensure_auth_tables_exists),
@@ -582,6 +593,7 @@ def setup_environment(app):
                 ("Latency DB", ensure_latency_tables_exists),
                 ("Strategy DB", ensure_strategy_tables_exists),
                 ("Sandbox DB", ensure_sandbox_tables_exists),
+                ("Trading DB", ensure_trading_tables_exists),
                 ("Action Center DB", ensure_action_center_tables_exists),
                 ("Chart Prefs DB", ensure_chart_prefs_tables_exists),
                 ("Market Calendar DB", ensure_market_calendar_tables_exists),
@@ -730,6 +742,78 @@ def setup_environment(app):
 
 app = create_app()
 
+
+def _is_market_hours_ist() -> bool:
+    """Return True when the Indian market is open on the current IST clock."""
+    import pytz
+    from datetime import datetime
+
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    if now.weekday() >= 5:
+        return False
+
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
+_pool_monitor_started = False
+
+
+def _pool_monitor_loop():
+    """Background loop that logs SQLAlchemy pool health during market hours."""
+    import time
+
+    while True:
+        try:
+            if _is_market_hours_ist():
+                from utils.database_config import log_pool_status
+                from database.traffic_db import _ensure_worker_running, log_queue_status
+
+                log_pool_status()
+                _ensure_worker_running()
+                log_queue_status()
+        except Exception as e:
+            logger.exception(f"Error logging database pool status: {e}")
+
+        time.sleep(60)
+
+
+def _start_pool_monitor_thread():
+    """Start the pool monitor once per process, skipping the debug parent."""
+    global _pool_monitor_started
+
+    if _pool_monitor_started:
+        return
+
+    flask_debug = os.getenv("FLASK_DEBUG", "").lower() in ("true", "1", "t")
+    if flask_debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+
+    import threading
+
+    _pool_monitor_started = True
+    threading.Thread(target=_pool_monitor_loop, name="DBPoolMonitor", daemon=True).start()
+    logger.debug("Started DB pool monitor thread")
+
+
+@app.route("/system/pool-status", methods=["GET"])
+def get_system_pool_status():
+    """Return live SQLAlchemy pool statistics for monitoring."""
+    from flask import jsonify
+    from utils.database_config import get_pool_status
+
+    return jsonify({"status": "success", "data": get_pool_status()})
+
+
+@app.route("/system/queue-status", methods=["GET"])
+def get_system_queue_status():
+    """Return live traffic log queue statistics for monitoring."""
+    from database.traffic_db import get_queue_status
+
+    return get_queue_status()
+
 # Explicitly call the setup environment function
 setup_environment(app)
 
@@ -759,41 +843,42 @@ def _restore_caches_background():
             logger.debug(f"Cache restoration skipped: {e}")
 
 threading.Thread(target=_restore_caches_background, daemon=True).start()
+_start_pool_monitor_thread()
 
 
 # Database session cleanup (teardown handler)
 @app.teardown_appcontext
 def shutdown_database_sessions(exception=None):
     """Remove scoped sessions after each request to prevent FD leaks"""
-    try:
-        from database.auth_db import db_session
-        db_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing auth db_session: {e}")
+    cleanup_targets = [
+        ("database.auth_db", "db_session", "auth db_session"),
+        ("database.user_db", "db_session", "user db_session"),
+        ("database.settings_db", "db_session", "settings db_session"),
+        ("database.flow_db", "db_session", "flow db_session"),
+        ("database.action_center_db", "db_session", "action_center db_session"),
+        ("database.leverage_db", "db_session", "leverage db_session"),
+        ("database.market_calendar_db", "db_session", "market_calendar db_session"),
+        ("database.qty_freeze_db", "db_session", "qty_freeze db_session"),
+        ("database.chart_prefs_db", "db_session", "chart_prefs db_session"),
+        ("database.strategy_db", "db_session", "strategy db_session"),
+        ("database.chartink_db", "db_session", "chartink db_session"),
+        ("database.analyzer_db", "db_session", "analyzer db_session"),
+        ("database.sandbox_db", "db_session", "sandbox db_session"),
+        ("database.trading_db", "TradingSession", "trading session"),
+        ("database.symbol", "db_session", "symbol db_session"),
+        ("database.traffic_db", "logs_session", "logs_session"),
+        ("database.apilog_db", "db_session", "apilog_session"),
+        ("database.latency_db", "latency_session", "latency_session"),
+        ("database.health_db", "health_session", "health_session"),
+        ("database.telegram_db", "db_session", "telegram db_session"),
+    ]
 
-    try:
-        from database.traffic_db import logs_session
-        logs_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing logs_session: {e}")
-
-    try:
-        from database.apilog_db import db_session as apilog_session
-        apilog_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing apilog_session: {e}")
-
-    try:
-        from database.latency_db import latency_session
-        latency_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing latency_session: {e}")
-
-    try:
-        from database.health_db import health_session
-        health_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing health_session: {e}")
+    for module_name, attr_name, label in cleanup_targets:
+        try:
+            module = __import__(module_name, fromlist=[attr_name])
+            getattr(module, attr_name).remove()
+        except Exception as e:
+            logger.error(f"Error removing {label}: {e}")
 
 
 # Integrate the WebSocket proxy server with the Flask app

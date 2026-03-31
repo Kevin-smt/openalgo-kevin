@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
+import { nowIstIso } from '@/utils/time'
 
 interface AuthSyncProps {
   children: React.ReactNode
@@ -32,7 +33,7 @@ export function AuthSync({ children }: AuthSyncProps) {
               username: data.user,
               broker: data.broker,
               isLoggedIn: true,
-              loginTime: new Date().toISOString(),
+              loginTime: nowIstIso(),
             })
             // Store the API key for trading API calls
             if (data.api_key) {

@@ -16,30 +16,26 @@ Follows industry standards (draft-inadarei-api-health-check):
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
 from sqlalchemy.sql import func
+
+from utils.database_config import SMALL_POOL_CONFIG, create_engine_from_env
+from utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
 # Use a separate database for health monitoring
-HEALTH_DATABASE_URL = os.getenv("HEALTH_DATABASE_URL", "sqlite:///db/health.db")
-
-# Conditionally create engine based on DB type
-if HEALTH_DATABASE_URL and "sqlite" in HEALTH_DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    health_engine = create_engine(
-        HEALTH_DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    health_engine = create_engine(
-        HEALTH_DATABASE_URL, pool_size=50, max_overflow=100, pool_timeout=10
-    )
+HEALTH_DATABASE_URL = os.getenv("HEALTH_DATABASE_URL", "")
+health_engine = create_engine_from_env(
+    "HEALTH_DATABASE_URL",
+    default_prefix="HEALTH_DB",
+    fallback_url=os.getenv("DATABASE_URL"),
+    pool_config=SMALL_POOL_CONFIG,
+)
 
 health_session = scoped_session(
     sessionmaker(autocommit=False, autoflush=False, bind=health_engine)
@@ -195,7 +191,7 @@ class HealthMetric(HealthBase):
     def get_metrics_history(hours=24):
         """Get metrics for the specified number of hours"""
         try:
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+            cutoff = now_ist() - timedelta(hours=hours)
             return (
                 HealthMetric.query.filter(HealthMetric.timestamp >= cutoff)
                 .order_by(HealthMetric.timestamp.asc())
@@ -209,7 +205,7 @@ class HealthMetric(HealthBase):
     def get_stats(hours=24):
         """Get aggregated statistics for the specified time period"""
         try:
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+            cutoff = now_ist() - timedelta(hours=hours)
 
             # Get metrics for the time period
             metrics = (
@@ -344,7 +340,7 @@ class HealthAlert(HealthBase):
 
             if existing:
                 # Update existing alert timestamp
-                existing.timestamp = datetime.now(timezone.utc)
+                existing.timestamp = now_ist()
                 existing.metric_value = metric_value
                 health_session.commit()
                 return existing
@@ -387,7 +383,7 @@ class HealthAlert(HealthBase):
             alert = HealthAlert.query.get(alert_id)
             if alert:
                 alert.acknowledged = True
-                alert.acknowledged_at = datetime.now(timezone.utc)
+                alert.acknowledged_at = now_ist()
                 health_session.commit()
                 return True
             return False
@@ -403,7 +399,7 @@ class HealthAlert(HealthBase):
             alert = HealthAlert.query.get(alert_id)
             if alert:
                 alert.resolved = True
-                alert.resolved_at = datetime.now(timezone.utc)
+                alert.resolved_at = now_ist()
                 health_session.commit()
                 logger.info(f"Alert resolved: {alert.message}")
                 return True
@@ -424,7 +420,7 @@ class HealthAlert(HealthBase):
                 # Resolve if current value is below healthy threshold
                 if current_value < healthy_threshold:
                     alert.resolved = True
-                    alert.resolved_at = datetime.now(timezone.utc)
+                    alert.resolved_at = now_ist()
                     logger.info(
                         f"Auto-resolved alert: {alert.message} "
                         f"(current: {current_value}, threshold: {healthy_threshold})"
@@ -438,12 +434,6 @@ class HealthAlert(HealthBase):
 
 def init_health_db():
     """Initialize the health monitoring database"""
-    # Extract directory from database URL and create if it doesn't exist
-    db_path = HEALTH_DATABASE_URL.replace("sqlite:///", "")
-    db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(HealthBase, health_engine, "Health Monitoring DB", logger)
@@ -455,7 +445,7 @@ def purge_old_metrics(days=7):
     Keep alerts forever for historical analysis.
     """
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff = now_ist() - timedelta(days=days)
 
         # Delete old metrics
         deleted = (

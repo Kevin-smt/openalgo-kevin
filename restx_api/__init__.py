@@ -27,6 +27,10 @@ from .intervals import api as intervals_ns
 from .margin import api as margin_ns
 from .market_holidays import api as market_holidays_ns
 from .market_timings import api as market_timings_ns
+from .local_orderbook import api as local_orderbook_ns
+from .local_holdings import api as local_holdings_ns
+from .local_positionbook import api as local_positionbook_ns
+from .local_tradebook import api as local_tradebook_ns
 from .modify_order import api as modify_order_ns
 from .multi_option_greeks import api as multi_option_greeks_ns
 from .multiquotes import api as multiquotes_ns
@@ -67,6 +71,10 @@ api.add_namespace(option_chain_ns, path="/optionchain")
 api.add_namespace(intervals_ns, path="/intervals")
 api.add_namespace(funds_ns, path="/funds")
 api.add_namespace(orderbook_ns, path="/orderbook")
+api.add_namespace(local_orderbook_ns, path="/localorderbook")
+api.add_namespace(local_positionbook_ns, path="/localpositionbook")
+api.add_namespace(local_tradebook_ns, path="/localtradebook")
+api.add_namespace(local_holdings_ns, path="/localholdings")
 api.add_namespace(tradebook_ns, path="/tradebook")
 api.add_namespace(positionbook_ns, path="/positionbook")
 api.add_namespace(holdings_ns, path="/holdings")

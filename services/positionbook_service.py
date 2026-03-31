@@ -3,6 +3,7 @@ import traceback
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
+from database.trading_db import _resolve_ledger_user_id, upsert_positions
 from utils.logging import get_logger
 
 # Initialize logger
@@ -78,7 +79,10 @@ def import_broker_module(broker_name: str) -> dict[str, Any] | None:
 
 
 def get_positionbook_with_auth(
-    auth_token: str, broker: str, original_data: dict[str, Any] = None
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any] = None,
+    user_id: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get position book details using provided auth token.
@@ -139,6 +143,33 @@ def get_positionbook_with_auth(
 
         # Format numeric values to 2 decimal places
         formatted_positions = format_position_data(positions_data)
+        logger.info(
+            "[LEDGER DEBUG] positionbook fetch complete: broker=%s positions=%s api_key_present=%s user_id=%s",
+            broker,
+            len(formatted_positions) if isinstance(formatted_positions, list) else "n/a",
+            bool(original_data.get("apikey") if original_data else None),
+            user_id,
+        )
+
+        try:
+            api_key = original_data.get("apikey") if original_data else None
+            ledger_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
+            logger.info(
+                "[LEDGER DEBUG] positionbook mirror start: resolved_user_id=%s broker=%s",
+                ledger_user_id,
+                broker,
+            )
+
+            if ledger_user_id:
+                upsert_positions(ledger_user_id, broker, formatted_positions, api_key=api_key)
+                logger.info(
+                    "[LEDGER DEBUG] positions mirrored: user=%s broker=%s rows=%s",
+                    ledger_user_id,
+                    broker,
+                    len(formatted_positions) if isinstance(formatted_positions, list) else 0,
+                )
+        except Exception as exc:
+            logger.warning(f"Position mirror sync failed (non-critical): {exc}")
 
         return True, {"status": "success", "data": formatted_positions}, 200
     except Exception as e:
@@ -148,7 +179,10 @@ def get_positionbook_with_auth(
 
 
 def get_positionbook(
-    api_key: str | None = None, auth_token: str | None = None, broker: str | None = None
+    api_key: str | None = None,
+    auth_token: str | None = None,
+    broker: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get position book details.
@@ -171,11 +205,11 @@ def get_positionbook(
         if AUTH_TOKEN is None:
             return False, {"status": "error", "message": "Invalid openalgo apikey"}, 403
         original_data = {"apikey": api_key}
-        return get_positionbook_with_auth(AUTH_TOKEN, broker_name, original_data)
+        return get_positionbook_with_auth(AUTH_TOKEN, broker_name, original_data, user_id=user_id)
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return get_positionbook_with_auth(auth_token, broker, None)
+        return get_positionbook_with_auth(auth_token, broker, None, user_id=user_id)
 
     # Case 3: Invalid parameters
     else:

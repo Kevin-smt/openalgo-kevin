@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -756,6 +757,7 @@ def get_symbol_info(symbol: str, exchange: str) -> SymbolData | None:
 
 
 # Database fallback functions (imported from original token_db)
+@lru_cache(maxsize=10000)
 def get_token_dbquery(symbol: str, exchange: str) -> str | None:
     """Query database for token by symbol and exchange"""
     try:
@@ -771,6 +773,7 @@ def get_token_dbquery(symbol: str, exchange: str) -> str | None:
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_symbol_dbquery(token: str, exchange: str) -> str | None:
     """Query database for symbol by token and exchange"""
     try:
@@ -786,6 +789,7 @@ def get_symbol_dbquery(token: str, exchange: str) -> str | None:
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_br_symbol_dbquery(symbol: str, exchange: str) -> str | None:
     """Query database for broker symbol"""
     try:
@@ -801,6 +805,7 @@ def get_br_symbol_dbquery(symbol: str, exchange: str) -> str | None:
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_oa_symbol_dbquery(brsymbol: str, exchange: str) -> str | None:
     """Query database for OpenAlgo symbol"""
     try:
@@ -816,6 +821,7 @@ def get_oa_symbol_dbquery(brsymbol: str, exchange: str) -> str | None:
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_brexchange_dbquery(symbol: str, exchange: str) -> str | None:
     """Query database for broker exchange"""
     try:
@@ -831,6 +837,7 @@ def get_brexchange_dbquery(symbol: str, exchange: str) -> str | None:
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_symbol_info_dbquery(symbol: str, exchange: str) -> SymbolData | None:
     """Query database for full symbol information, returns SymbolData object"""
     try:
@@ -885,12 +892,23 @@ def clear_cache():
     """Clear the cache - useful for manual refresh"""
     cache = get_cache()
     cache.clear_cache()
+    clear_symbol_query_caches()
 
 
 def get_cache_stats() -> dict:
     """Get cache statistics for monitoring"""
     cache = get_cache()
     return cache.get_cache_info()
+
+
+def clear_symbol_query_caches() -> None:
+    """Clear cached database fallback lookups when master contracts refresh."""
+    get_token_dbquery.cache_clear()
+    get_symbol_dbquery.cache_clear()
+    get_br_symbol_dbquery.cache_clear()
+    get_oa_symbol_dbquery.cache_clear()
+    get_brexchange_dbquery.cache_clear()
+    get_symbol_info_dbquery.cache_clear()
 
 
 # Bulk operations for performance

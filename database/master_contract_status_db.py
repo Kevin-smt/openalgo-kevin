@@ -1,37 +1,33 @@
 import json
 import logging
 import os
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, Text, create_engine, text
+from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool
 
+from utils.database_config import create_engine_from_env
+from utils.timezone import ensure_ist, now_ist
+
+
+def _now_ist_naive():
+    return now_ist().replace(tzinfo=None)
 logger = logging.getLogger(__name__)
 
 # If a download stays in 'downloading' state longer than this, treat it as stuck/failed
 DOWNLOAD_TIMEOUT_MINUTES = 5
 
 # Get the database path from environment variable or use default
-DB_PATH = os.getenv("DATABASE_URL", "sqlite:///db/openalgo.db")
-
-# Ensure the directory exists
-os.makedirs(os.path.dirname(DB_PATH.replace("sqlite:///", "")), exist_ok=True)
-
-# Create the engine and session
-# Conditionally create engine based on DB type
-if DB_PATH and "sqlite" in DB_PATH:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    engine = create_engine(
-        DB_PATH,
-        echo=False,
-        poolclass=NullPool,
-        connect_args={"check_same_thread": False, "timeout": 30},
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    engine = create_engine(DB_PATH, echo=False, pool_size=50, max_overflow=100, pool_timeout=10)
+DB_PATH = os.getenv("DATABASE_URL", "")
+engine = create_engine_from_env(
+    "DATABASE_URL",
+    default_prefix="DB",
+    echo=False,
+    pool_size=50,
+    max_overflow=100,
+    pool_timeout=10,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -43,7 +39,7 @@ class MasterContractStatus(Base):
     broker = Column(String, primary_key=True)
     status = Column(String, default="pending")  # pending, downloading, success, error
     message = Column(String)
-    last_updated = Column(DateTime, default=datetime.now)
+    last_updated = Column(DateTime, default=_now_ist_naive)
     total_symbols = Column(String, default="0")
     is_ready = Column(Boolean, default=False)
 
@@ -69,7 +65,7 @@ def init_broker_status(broker):
             # Update existing status
             existing.status = "pending"
             existing.message = "Master contract download pending"
-            existing.last_updated = datetime.now()
+            existing.last_updated = _now_ist_naive()
             existing.is_ready = False
         else:
             # Create new status
@@ -77,7 +73,7 @@ def init_broker_status(broker):
                 broker=broker,
                 status="pending",
                 message="Master contract download pending",
-                last_updated=datetime.now(),
+                last_updated=_now_ist_naive(),
                 is_ready=False,
             )
             session.add(status)
@@ -101,7 +97,7 @@ def update_status(broker, status, message, total_symbols=None):
         if broker_status:
             broker_status.status = status
             broker_status.message = message
-            broker_status.last_updated = datetime.now()
+            broker_status.last_updated = _now_ist_naive()
             broker_status.is_ready = status == "success"
 
             if total_symbols is not None:
@@ -112,7 +108,7 @@ def update_status(broker, status, message, total_symbols=None):
                 broker=broker,
                 status=status,
                 message=message,
-                last_updated=datetime.now(),
+                last_updated=_now_ist_naive(),
                 is_ready=(status == "success"),
                 total_symbols=str(total_symbols) if total_symbols else "0",
             )
@@ -140,7 +136,7 @@ def get_status(broker):
             if (
                 status.status == "downloading"
                 and status.last_updated
-                and datetime.now() - status.last_updated > timedelta(minutes=DOWNLOAD_TIMEOUT_MINUTES)
+                and _now_ist_naive() - ensure_ist(status.last_updated).replace(tzinfo=None) > timedelta(minutes=DOWNLOAD_TIMEOUT_MINUTES)
             ):
                 logger.warning(
                     f"Download for {broker} stuck for >{DOWNLOAD_TIMEOUT_MINUTES}min, marking as error"
@@ -150,7 +146,7 @@ def get_status(broker):
                     f"Download timed out (stuck for >{DOWNLOAD_TIMEOUT_MINUTES} minutes). "
                     "Click Force Download to retry."
                 )
-                status.last_updated = datetime.now()
+                status.last_updated = _now_ist_naive()
                 status.is_ready = False
                 session.commit()
 
@@ -166,11 +162,11 @@ def get_status(broker):
                 "broker": status.broker,
                 "status": status.status,
                 "message": status.message,
-                "last_updated": status.last_updated.isoformat() if status.last_updated else None,
+                "last_updated": ensure_ist(status.last_updated).isoformat() if status.last_updated else None,
                 "total_symbols": status.total_symbols,
                 "is_ready": status.is_ready,
                 # Smart download fields
-                "last_download_time": status.last_download_time.isoformat() if status.last_download_time else None,
+                "last_download_time": ensure_ist(status.last_download_time).isoformat() if status.last_download_time else None,
                 "download_date": status.download_date.isoformat() if status.download_date else None,
                 "exchange_stats": exchange_stats,
                 "download_duration_seconds": status.download_duration_seconds,
@@ -224,7 +220,7 @@ def get_last_download_time(broker):
     session = SessionLocal()
     try:
         status = session.query(MasterContractStatus).filter_by(broker=broker).first()
-        return status.last_download_time if status else None
+        return ensure_ist(status.last_download_time) if status and status.last_download_time else None
     except Exception as e:
         logger.exception(f"Error getting last download time for {broker}: {str(e)}")
         return None
@@ -238,8 +234,8 @@ def update_download_stats(broker, duration_seconds, exchange_stats=None):
     try:
         status = session.query(MasterContractStatus).filter_by(broker=broker).first()
         if status:
-            status.last_download_time = datetime.now()
-            status.download_date = date.today()
+            status.last_download_time = _now_ist_naive()
+            status.download_date = now_ist().date()
             status.download_duration_seconds = duration_seconds
             if exchange_stats:
                 status.exchange_stats = json.dumps(exchange_stats)
@@ -261,7 +257,7 @@ def mark_status_ready_without_download(broker):
             status.is_ready = True
             status.status = "success"
             status.message = "Using cached master contract"
-            status.last_updated = datetime.now()
+            status.last_updated = _now_ist_naive()
             session.commit()
             logger.info(f"Marked existing master contract as ready for {broker}")
             return True

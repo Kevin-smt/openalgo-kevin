@@ -2,6 +2,19 @@ import os
 import sys
 
 from dotenv import load_dotenv
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
+
+from utils.database_config import (
+    configure_database_environment,
+    ensure_runtime_postgres_databases_exist,
+    get_engine,
+    get_resolved_database_urls,
+)
+from utils.timezone import configure_process_timezone
+
+configure_process_timezone()
 
 
 def configure_llvmlite_paths() -> None:
@@ -206,6 +219,61 @@ def check_env_version_compatibility() -> bool:
     return True
 
 
+def _describe_database_url(database_url: str) -> dict[str, str]:
+    parsed = make_url(database_url)
+    return {
+        "driver": parsed.drivername,
+        "host": parsed.host or "",
+        "port": str(parsed.port or ""),
+        "database": parsed.database or "",
+        "user": parsed.username or "",
+    }
+
+
+def validate_database_connections() -> bool:
+    """Verify that every resolved PostgreSQL database is reachable."""
+    runtime_urls = get_resolved_database_urls()
+    errors: list[str] = []
+
+    for env_var, database_url in runtime_urls.items():
+        if not database_url:
+            errors.append(f"{env_var} is empty and could not be resolved.")
+            continue
+
+        if not database_url.startswith("postgresql"):
+            errors.append(
+                f"{env_var} resolved to a non-PostgreSQL URL and cannot be used at runtime: {database_url}"
+            )
+            continue
+
+        engine = get_engine(database_url)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except SQLAlchemyError as exc:
+            info = _describe_database_url(database_url)
+            errors.append(
+                f"{env_var} -> database '{info['database']}' on {info['host']}:{info['port']} "
+                f"as user '{info['user']}' is unreachable: {exc}"
+            )
+        finally:
+            engine.dispose()
+
+    if errors:
+        print("\n" + "=" * 70)
+        print("❌ PostgreSQL preflight check failed")
+        print("=" * 70)
+        for error in errors:
+            print(f"- {error}")
+        print("")
+        print("Make sure the PostgreSQL server is running and the databases exist.")
+        print("If this is a local setup, OpenAlgo will try to create missing databases automatically on startup.")
+        print("=" * 70)
+        return False
+
+    return True
+
+
 def load_and_check_env_variables() -> None:
     """
     Load environment variables from .env and check for required critical variables.
@@ -233,6 +301,36 @@ def load_and_check_env_variables() -> None:
     # Load environment variables from the .env file with override=True to ensure values are updated
     load_dotenv(dotenv_path=env_path, override=True)
 
+    # Keep the new environment selector compatible with older configs.
+    # If ENV is missing, infer it from FLASK_ENV; otherwise default to local.
+    if not os.getenv("ENV"):
+        flask_env = os.getenv("FLASK_ENV", "").lower()
+        os.environ["ENV"] = "production" if flask_env == "production" else "local"
+
+    # Resolve the selected LOCAL/PROD PostgreSQL profile into runtime URLs.
+    # This preserves backwards compatibility for modules that still read
+    # DATABASE_URL directly from the environment.
+    configure_database_environment()
+
+    if not os.getenv("DATABASE_URL"):
+        print("Error: DATABASE_URL could not be resolved from the active profile.")
+        print("Solution: Set DATABASE_URL directly or provide the LOCAL_DB_* / PROD_DB_* variables.")
+        sys.exit(1)
+
+    # Create missing local PostgreSQL databases before any DB engine is initialized.
+    try:
+        created_databases = ensure_runtime_postgres_databases_exist()
+        if created_databases:
+            print("Created missing PostgreSQL database(s): " + ", ".join(sorted(created_databases)))
+    except Exception as e:
+        print("\nError: Unable to auto-create one or more PostgreSQL databases.")
+        print(f"Details: {e}")
+        sys.exit(1)
+
+    # Fail fast with a precise message if any of the runtime databases is still unreachable.
+    if not validate_database_connections():
+        sys.exit(1)
+
     # Define the required environment variables
     required_vars = [
         "ENV_CONFIG_VERSION",  # Version tracking for configuration compatibility
@@ -241,7 +339,6 @@ def load_and_check_env_variables() -> None:
         "REDIRECT_URL",
         "APP_KEY",
         "API_KEY_PEPPER",  # Added API_KEY_PEPPER as it's required for security
-        "DATABASE_URL",
         "NGROK_ALLOW",
         "HOST_SERVER",
         "FLASK_HOST_IP",

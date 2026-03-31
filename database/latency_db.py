@@ -1,29 +1,25 @@
 import logging
 import os
-from datetime import datetime
+from datetime import timedelta
 
-from sqlalchemy import JSON, Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import JSON, Column, DateTime, Float, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
 from sqlalchemy.sql import func
+
+from utils.database_config import SMALL_POOL_CONFIG, create_engine_from_env
+from utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
 # Use a separate database for latency logs
-LATENCY_DATABASE_URL = os.getenv("LATENCY_DATABASE_URL", "sqlite:///db/latency.db")
-
-# Conditionally create engine based on DB type
-if LATENCY_DATABASE_URL and "sqlite" in LATENCY_DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    latency_engine = create_engine(
-        LATENCY_DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    latency_engine = create_engine(
-        LATENCY_DATABASE_URL, pool_size=50, max_overflow=100, pool_timeout=10
-    )
+LATENCY_DATABASE_URL = os.getenv("LATENCY_DATABASE_URL", "")
+latency_engine = create_engine_from_env(
+    "LATENCY_DATABASE_URL",
+    default_prefix="LATENCY_DB",
+    fallback_url=os.getenv("DATABASE_URL"),
+    pool_config=SMALL_POOL_CONFIG,
+)
 
 latency_session = scoped_session(
     sessionmaker(autocommit=False, autoflush=False, bind=latency_engine)
@@ -273,12 +269,6 @@ class OrderLatency(LatencyBase):
 
 def init_latency_db():
     """Initialize the latency database"""
-    # Extract directory from database URL and create if it doesn't exist
-    db_path = LATENCY_DATABASE_URL.replace("sqlite:///", "")
-    db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(LatencyBase, latency_engine, "Latency DB", logger)
@@ -306,7 +296,7 @@ def purge_old_data_logs(days=7):
     try:
         from datetime import timedelta
 
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = now_ist() - timedelta(days=days)
 
         # Delete non-order logs older than cutoff
         deleted = (

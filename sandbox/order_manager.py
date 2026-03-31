@@ -517,6 +517,14 @@ class OrderManager:
                 logger.info(
                     f"Order rejected: {orderid} - {symbol} {action} {quantity} - Reason: {cnc_sell_rejection_reason}"
                 )
+                logger.info(
+                    "[LEDGER DEBUG] sandbox order persisted: orderid=%s user=%s symbol=%s status=%s rejected_reason=%s",
+                    orderid,
+                    self.user_id,
+                    symbol,
+                    "rejected",
+                    cnc_sell_rejection_reason,
+                )
 
                 return (
                     False,
@@ -558,6 +566,14 @@ class OrderManager:
             db_session.commit()
 
             logger.info(f"Order placed: {orderid} - {symbol} {action} {quantity} @ {price_type}")
+            logger.info(
+                "[LEDGER DEBUG] sandbox order persisted: orderid=%s user=%s symbol=%s status=%s price_type=%s",
+                orderid,
+                self.user_id,
+                symbol,
+                "open",
+                price_type,
+            )
 
             # Notify WebSocket execution engine to index and subscribe this symbol
             try:

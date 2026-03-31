@@ -7,6 +7,7 @@ Handles scheduled workflow execution using APScheduler (Flask/sync version)
 import logging
 import os
 import threading
+from contextlib import nullcontext
 from collections.abc import Callable
 from datetime import datetime
 from typing import Optional
@@ -18,6 +19,16 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger(__name__)
+
+
+def _app_context_or_null():
+    """Return a Flask app context when available, otherwise a no-op context."""
+    try:
+        from app import app as flask_app
+
+        return flask_app.app_context()
+    except Exception:
+        return nullcontext()
 
 
 class FlowScheduler:
@@ -46,7 +57,7 @@ class FlowScheduler:
                 return
 
             if db_url is None:
-                db_url = os.getenv("DATABASE_URL", "sqlite:///db/openalgo.db")
+                db_url = os.getenv("DATABASE_URL")
 
             self._api_key = api_key
 
@@ -243,10 +254,11 @@ def execute_workflow_scheduled(workflow_id: int, api_key: str = None):
         return
 
     try:
-        result = execute_workflow(workflow_id, api_key=api_key)
-        logger.info(
-            f"Scheduled execution result for workflow {workflow_id}: {result.get('status')}"
-        )
+        with _app_context_or_null():
+            result = execute_workflow(workflow_id, api_key=api_key)
+            logger.info(
+                f"Scheduled execution result for workflow {workflow_id}: {result.get('status')}"
+            )
     except Exception as e:
         logger.exception(f"Scheduled execution failed for workflow {workflow_id}: {e}")
 

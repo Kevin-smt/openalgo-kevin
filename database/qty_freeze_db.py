@@ -15,24 +15,19 @@ import csv
 import os
 from typing import Dict, Optional
 
-from sqlalchemy import Column, Index, Integer, String, create_engine
+from sqlalchemy import Column, Index, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
 
+from utils.database_config import create_engine_from_env
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Conditionally create engine based on DB type
-if DATABASE_URL and "sqlite" in DATABASE_URL:
-    engine = create_engine(
-        DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    engine = create_engine(DATABASE_URL, pool_size=50, max_overflow=100, pool_timeout=10)
+engine = create_engine_from_env(
+    "DATABASE_URL", default_prefix="DB", pool_size=50, max_overflow=100, pool_timeout=10
+)
 
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()

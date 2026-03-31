@@ -5,6 +5,7 @@ import { useCallback, useRef, useEffect, useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { showToast } from '@/utils/toast'
+import { nowIstIso } from '@/utils/time'
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -226,7 +227,7 @@ function FlowEditorContent() {
     },
     onError: (error: Error) => {
       setExecutionStatus('error')
-      setExecutionLogs([{ time: new Date().toISOString(), message: error.message, level: 'error' }])
+      setExecutionLogs([{ time: nowIstIso(), message: error.message, level: 'error' }])
       showToast.error(error.message, 'flow')
     },
   })

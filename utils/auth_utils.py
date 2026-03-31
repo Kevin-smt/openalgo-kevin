@@ -258,6 +258,14 @@ def async_master_contract_download(broker):
     # Update status to downloading
     update_status(broker, "downloading", "Master contract download in progress")
 
+    try:
+        from utils.database_config import log_pool_status
+
+        logger.info(f"[LOGIN] Pool status before master contract download for {broker}")
+        log_pool_status()
+    except Exception as pool_error:
+        logger.debug(f"Pool status logging skipped before download for {broker}: {pool_error}")
+
     # Dynamically construct the module path based on the broker
     module_path = f"broker.{broker}.database.master_contract_db"
 
@@ -316,6 +324,14 @@ def async_master_contract_download(broker):
         except Exception as catch_up_error:
             logger.exception(f"Failed to run catch-up tasks: {catch_up_error}")
             # Don't fail the whole process if catch-up fails
+
+        try:
+            from utils.database_config import log_pool_status
+
+            logger.info(f"[LOGIN] Pool status after master contract download for {broker}")
+            log_pool_status()
+        except Exception as pool_error:
+            logger.debug(f"Pool status logging skipped after download for {broker}: {pool_error}")
 
     except Exception as e:
         logger.exception(f"Error during master contract download for {broker}: {str(e)}")

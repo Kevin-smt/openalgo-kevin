@@ -61,6 +61,27 @@ export interface MultiQuotesApiResponse {
   message?: string
 }
 
+async function tryLocalThenLive<T>(
+  localCall: () => Promise<ApiResponse<T>>,
+  liveCall: () => Promise<ApiResponse<T>>,
+  hasLocalData: (response: ApiResponse<T>) => boolean
+): Promise<ApiResponse<T>> {
+  try {
+    const localResponse = await localCall()
+    if (localResponse.status === 'success' && hasLocalData(localResponse)) {
+      return localResponse
+    }
+  } catch {
+    // Fall back to the live broker path below.
+  }
+
+  return liveCall()
+}
+
+function hasArrayData<T>(response: ApiResponse<T[]>) {
+  return Array.isArray(response.data) && response.data.length > 0
+}
+
 export const tradingApi = {
   /**
    * Get real-time quotes for a symbol
@@ -122,10 +143,21 @@ export const tradingApi = {
    * Get positions
    */
   getPositions: async (apiKey: string): Promise<ApiResponse<Position[]>> => {
-    const response = await apiClient.post<ApiResponse<Position[]>>('/positionbook', {
-      apikey: apiKey,
-    })
-    return response.data
+    return tryLocalThenLive(
+      async () => {
+        const response = await apiClient.post<ApiResponse<Position[]>>('/localpositionbook', {
+          apikey: apiKey,
+        })
+        return response.data
+      },
+      async () => {
+        const response = await apiClient.post<ApiResponse<Position[]>>('/positionbook', {
+          apikey: apiKey,
+        })
+        return response.data
+      },
+      hasArrayData
+    )
   },
 
   /**
@@ -134,23 +166,49 @@ export const tradingApi = {
   getOrders: async (
     apiKey: string
   ): Promise<ApiResponse<{ orders: Order[]; statistics: OrderStats }>> => {
-    const response = await apiClient.post<ApiResponse<{ orders: Order[]; statistics: OrderStats }>>(
-      '/orderbook',
-      {
-        apikey: apiKey,
-      }
+    return tryLocalThenLive(
+      async () => {
+        const response = await apiClient.get<ApiResponse<{ orders: Order[]; statistics: OrderStats }>>(
+          '/localorderbook',
+          {
+            params: {
+              apikey: apiKey,
+            },
+          }
+        )
+        return response.data
+      },
+      async () => {
+        const response = await apiClient.post<
+          ApiResponse<{ orders: Order[]; statistics: OrderStats }>
+        >('/orderbook', {
+          apikey: apiKey,
+        })
+        return response.data
+      },
+      (response) => Array.isArray(response.data?.orders) && response.data.orders.length > 0
     )
-    return response.data
   },
 
   /**
    * Get trade book
    */
   getTrades: async (apiKey: string): Promise<ApiResponse<Trade[]>> => {
-    const response = await apiClient.post<ApiResponse<Trade[]>>('/tradebook', {
-      apikey: apiKey,
-    })
-    return response.data
+    return tryLocalThenLive(
+      async () => {
+        const response = await apiClient.post<ApiResponse<Trade[]>>('/localtradebook', {
+          apikey: apiKey,
+        })
+        return response.data
+      },
+      async () => {
+        const response = await apiClient.post<ApiResponse<Trade[]>>('/tradebook', {
+          apikey: apiKey,
+        })
+        return response.data
+      },
+      hasArrayData
+    )
   },
 
   /**
@@ -159,12 +217,25 @@ export const tradingApi = {
   getHoldings: async (
     apiKey: string
   ): Promise<ApiResponse<{ holdings: Holding[]; statistics: PortfolioStats }>> => {
-    const response = await apiClient.post<
-      ApiResponse<{ holdings: Holding[]; statistics: PortfolioStats }>
-    >('/holdings', {
-      apikey: apiKey,
-    })
-    return response.data
+    return tryLocalThenLive(
+      async () => {
+        const response = await apiClient.post<
+          ApiResponse<{ holdings: Holding[]; statistics: PortfolioStats }>
+        >('/localholdings', {
+          apikey: apiKey,
+        })
+        return response.data
+      },
+      async () => {
+        const response = await apiClient.post<
+          ApiResponse<{ holdings: Holding[]; statistics: PortfolioStats }>
+        >('/holdings', {
+          apikey: apiKey,
+        })
+        return response.data
+      },
+      (response) => Array.isArray(response.data?.holdings) && response.data.holdings.length > 0
+    )
   },
 
   /**

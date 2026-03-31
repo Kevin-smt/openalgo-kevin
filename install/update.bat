@@ -132,13 +132,14 @@ set "BACKUP_COUNT=0"
 if exist "%OPENALGO_DIR%\db\" (
     md "%BACKUP_DIR%" 2>nul
 
-    for %%f in (openalgo.db logs.db latency.db sandbox.db) do (
-        if exist "%OPENALGO_DIR%\db\%%f" (
-            copy /y "%OPENALGO_DIR%\db\%%f" "%BACKUP_DIR%\%%f" >nul 2>&1
-            echo   Backed up: %%f
-            set /a BACKUP_COUNT+=1
-        )
-    )
+    REM Not required - PostgreSQL is now used
+    REM for %%f in (openalgo.db logs.db latency.db sandbox.db) do (
+    REM     if exist "%OPENALGO_DIR%\db\%%f" (
+    REM         copy /y "%OPENALGO_DIR%\db\%%f" "%BACKUP_DIR%\%%f" >nul 2>&1
+    REM         echo   Backed up: %%f
+    REM         set /a BACKUP_COUNT+=1
+    REM     )
+    REM )
 
     if exist "%OPENALGO_DIR%\db\historify.duckdb" (
         copy /y "%OPENALGO_DIR%\db\historify.duckdb" "%BACKUP_DIR%\historify.duckdb" >nul 2>&1

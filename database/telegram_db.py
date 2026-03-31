@@ -5,7 +5,7 @@ Telegram Database Module using SQLAlchemy for secure database operations
 import base64
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from cachetools import TTLCache
@@ -22,14 +22,14 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    create_engine,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
 from sqlalchemy.sql import func
 
+from utils.database_config import create_engine_from_env
 from utils.logging import get_logger
+from utils.timezone import now_ist
 
 logger = get_logger(__name__)
 
@@ -41,12 +41,7 @@ _user_preferences_cache = TTLCache(maxsize=10000, ttl=1800)  # 30 minutes TTL
 _user_credentials_cache = TTLCache(maxsize=10000, ttl=1800)  # 30 minutes TTL
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db/telegram.db")
-if DATABASE_URL.startswith("sqlite:///") and ":memory:" not in DATABASE_URL:
-    # Ensure the directory exists for file-based SQLite, but not for in-memory
-    db_path = DATABASE_URL.replace("sqlite:///", "")
-    if os.path.dirname(db_path):  # Only create if a directory is specified
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # Encryption setup for API keys
 TELEGRAM_KEY_SALT = os.getenv("TELEGRAM_KEY_SALT", "telegram-openalgo-salt").encode()
@@ -69,17 +64,14 @@ def get_encryption_key():
 fernet = get_encryption_key()
 
 # Create engine and session
-# Conditionally create engine based on DB type
-if DATABASE_URL and "sqlite" in DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    engine = create_engine(
-        DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    engine = create_engine(
-        DATABASE_URL, pool_pre_ping=True, pool_recycle=3600, pool_size=50, max_overflow=100
-    )
+engine = create_engine_from_env(
+    "DATABASE_URL",
+    default_prefix="DB",
+    pool_size=50,
+    max_overflow=100,
+    pool_timeout=10,
+    pool_recycle=3600,
+)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 
 Base = declarative_base()
@@ -542,7 +534,7 @@ def log_command(telegram_id: int, command: str, chat_id: int = None, parameters:
 def get_command_stats(days: int = 7) -> dict:
     """Get command statistics for the last N days"""
     try:
-        since_date = datetime.now() - timedelta(days=days)
+        since_date = now_ist().replace(tzinfo=None) - timedelta(days=days)
 
         # Total commands
         total_commands = (

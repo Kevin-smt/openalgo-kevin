@@ -61,11 +61,42 @@ VALID_BROKERS = '${VALID_BROKERS:-fivepaisa,fivepaisaxts,aliceblue,angel,composi
 APP_KEY = '${APP_KEY}'
 API_KEY_PEPPER = '${API_KEY_PEPPER}'
 
+# Runtime environment selector
+ENV = '${ENV:-production}'
+
 # Database Configuration
-DATABASE_URL = '${DATABASE_URL:-sqlite:///db/openalgo.db}'
-LATENCY_DATABASE_URL = '${LATENCY_DATABASE_URL:-sqlite:///db/latency.db}'
-LOGS_DATABASE_URL = '${LOGS_DATABASE_URL:-sqlite:///db/logs.db}'
-SANDBOX_DATABASE_URL = '${SANDBOX_DATABASE_URL:-sqlite:///db/sandbox.db}'
+DATABASE_URL = '${DATABASE_URL:-}'
+LATENCY_DATABASE_URL = '${LATENCY_DATABASE_URL:-}'
+LOGS_DATABASE_URL = '${LOGS_DATABASE_URL:-}'
+SANDBOX_DATABASE_URL = '${SANDBOX_DATABASE_URL:-}'
+HEALTH_DATABASE_URL = '${HEALTH_DATABASE_URL:-}'
+HISTORIFY_DATABASE_URL = '${HISTORIFY_DATABASE_URL:-db/historify.duckdb}'
+
+# Local PostgreSQL profile (safe defaults for development)
+LOCAL_DB_HOST = '${LOCAL_DB_HOST:-localhost}'
+LOCAL_DB_PORT = '${LOCAL_DB_PORT:-5432}'
+LOCAL_DB_NAME = '${LOCAL_DB_NAME:-openalgo}'
+LOCAL_DB_USER = '${LOCAL_DB_USER:-postgres}'
+LOCAL_DB_PASSWORD = '${LOCAL_DB_PASSWORD:-postgres}'
+LOCAL_DB_SSLMODE = '${LOCAL_DB_SSLMODE:-disable}'
+LOCAL_DB_DRIVER = '${LOCAL_DB_DRIVER:-psycopg2}'
+LOCAL_LATENCY_DB_NAME = '${LOCAL_LATENCY_DB_NAME:-openalgo_latency}'
+LOCAL_LOGS_DB_NAME = '${LOCAL_LOGS_DB_NAME:-openalgo_logs}'
+LOCAL_SANDBOX_DB_NAME = '${LOCAL_SANDBOX_DB_NAME:-openalgo_sandbox}'
+LOCAL_HEALTH_DB_NAME = '${LOCAL_HEALTH_DB_NAME:-openalgo_health}'
+
+# Production PostgreSQL profile
+PROD_DB_HOST = '${PROD_DB_HOST:-}'
+PROD_DB_PORT = '${PROD_DB_PORT:-5432}'
+PROD_DB_NAME = '${PROD_DB_NAME:-openalgo}'
+PROD_DB_USER = '${PROD_DB_USER:-}'
+PROD_DB_PASSWORD = '${PROD_DB_PASSWORD:-}'
+PROD_DB_SSLMODE = '${PROD_DB_SSLMODE:-require}'
+PROD_DB_DRIVER = '${PROD_DB_DRIVER:-psycopg2}'
+PROD_LATENCY_DB_NAME = '${PROD_LATENCY_DB_NAME:-openalgo_latency}'
+PROD_LOGS_DB_NAME = '${PROD_LOGS_DB_NAME:-openalgo_logs}'
+PROD_SANDBOX_DB_NAME = '${PROD_SANDBOX_DB_NAME:-openalgo_sandbox}'
+PROD_HEALTH_DB_NAME = '${PROD_HEALTH_DB_NAME:-openalgo_health}'
 
 # Ngrok - Disabled for cloud deployment
 NGROK_ALLOW = '${NGROK_ALLOW:-FALSE}'

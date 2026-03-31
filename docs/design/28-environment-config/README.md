@@ -53,14 +53,34 @@ VALID_BROKERS = 'fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,dhan,dhan_s
 ### Database Configuration
 
 ```bash
-# Main database
-DATABASE_URL = 'sqlite:///db/openalgo.db'
+# Runtime environment selector
+ENV = 'local'  # or 'production'
 
-# Additional databases
-LATENCY_DATABASE_URL = 'sqlite:///db/latency.db'
-LOGS_DATABASE_URL = 'sqlite:///db/logs.db'
-SANDBOX_DATABASE_URL = 'sqlite:///db/sandbox.db'
+# Optional full URL overrides
+DATABASE_URL = ''
+LATENCY_DATABASE_URL = ''
+LOGS_DATABASE_URL = ''
+SANDBOX_DATABASE_URL = ''
+HEALTH_DATABASE_URL = ''
 HISTORIFY_DATABASE_URL = 'db/historify.duckdb'
+
+# Local PostgreSQL profile
+LOCAL_DB_HOST = 'localhost'
+LOCAL_DB_PORT = '5432'
+LOCAL_DB_NAME = 'openalgo'
+LOCAL_DB_USER = 'postgres'
+LOCAL_DB_PASSWORD = 'postgres'
+LOCAL_DB_SSLMODE = 'disable'
+LOCAL_DB_DRIVER = 'psycopg2'
+
+# Production PostgreSQL profile
+PROD_DB_HOST = 'your-prod-postgres-host'
+PROD_DB_PORT = '5432'
+PROD_DB_NAME = 'openalgo'
+PROD_DB_USER = 'openalgo'
+PROD_DB_PASSWORD = 'change-me'
+PROD_DB_SSLMODE = 'require'
+PROD_DB_DRIVER = 'psycopg2'
 ```
 
 ### Flask Application

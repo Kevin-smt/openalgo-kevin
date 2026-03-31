@@ -19,9 +19,10 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import timedelta
 
 import psutil
+from sqlalchemy import text
 
 from database.health_db import (
     HealthAlert,
@@ -30,6 +31,7 @@ from database.health_db import (
     init_health_db,
     purge_old_metrics,
 )
+from utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
@@ -110,34 +112,20 @@ def check_db_connectivity():
     overall_status = "pass"
 
     databases = {
-        "openalgo": "database.auth_db",
-        "logs": "database.traffic_db",
-        "latency": "database.latency_db",
+        "openalgo": ("database.auth_db", "engine"),
+        "logs": ("database.traffic_db", "logs_engine"),
+        "latency": ("database.latency_db", "latency_engine"),
+        "sandbox": ("database.sandbox_db", "engine"),
+        "health": ("database.health_db", "health_engine"),
     }
 
-    for db_name, module_path in databases.items():
+    for db_name, (module_name, engine_attr) in databases.items():
         try:
-            parts = module_path.rsplit(".", 1)
-            if len(parts) == 2:
-                module_name, _ = parts
-                module = __import__(module_name, fromlist=["db_session"])
-
-                # Try a simple query
-                if hasattr(module, "db_session"):
-                    session = getattr(module, "db_session")
-                    # Execute simple query to test connectivity
-                    session.execute("SELECT 1").fetchone()
-                    results[db_name] = "pass"
-                elif hasattr(module, "logs_session"):
-                    session = getattr(module, "logs_session")
-                    session.execute("SELECT 1").fetchone()
-                    results[db_name] = "pass"
-                elif hasattr(module, "latency_session"):
-                    session = getattr(module, "latency_session")
-                    session.execute("SELECT 1").fetchone()
-                    results[db_name] = "pass"
-                else:
-                    results[db_name] = "pass"  # Assume pass if no session found
+            module = __import__(module_name, fromlist=[engine_attr])
+            engine = getattr(module, engine_attr)
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            results[db_name] = "pass"
         except Exception as e:
             logger.error(f"Database connectivity check failed for {db_name}: {e}")
             results[db_name] = "fail"
@@ -283,7 +271,7 @@ def get_database_metrics():
             "openalgo": "database.auth_db",
             "logs": "database.traffic_db",
             "latency": "database.latency_db",
-            "apilog": "database.apilog_db",
+            "sandbox": "database.sandbox_db",
             "health": "database.health_db",
         }
 
@@ -299,6 +287,7 @@ def get_database_metrics():
                         "db_session",
                         "logs_session",
                         "latency_session",
+                        "sandbox_session",
                         "health_session",
                     ]
                     conn_count = 0
@@ -553,7 +542,7 @@ def collect_metrics():
             _cached_metrics.update(
                 {
                     "status": overall_status,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": now_ist().isoformat(),
                     "fd": fd_metrics,
                     "memory": memory_metrics,
                     "database": db_metrics,

@@ -33,6 +33,14 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _rollback_sandbox_session():
+    """Best-effort rollback for the thread-local sandbox session."""
+    try:
+        db_session.rollback()
+    except Exception as rollback_error:
+        logger.debug(f"Sandbox session rollback skipped: {rollback_error}")
+
+
 class ExecutionEngine:
     """Executes pending orders based on market data"""
 
@@ -48,6 +56,10 @@ class ExecutionEngine:
         Respects rate limits through batch processing
         """
         try:
+            # Ensure this worker starts from a clean session state each cycle.
+            # A previous exception in this thread can leave the scoped session aborted.
+            db_session.rollback()
+
             # Get all pending orders
             pending_orders = SandboxOrders.query.filter_by(order_status="open").all()
 
@@ -102,6 +114,9 @@ class ExecutionEngine:
 
         except Exception as e:
             logger.exception(f"Error in execution engine: {e}")
+        finally:
+            # Return the thread-local session to a clean state before the next cycle.
+            db_session.remove()
 
     def _fetch_quote(self, symbol, exchange):
         """
@@ -140,6 +155,7 @@ class ExecutionEngine:
 
         except Exception as e:
             # Handle all exceptions gracefully - don't stop execution engine
+            _rollback_sandbox_session()
             logger.debug(f"Exception fetching quote for {symbol}: {str(e)}")
             return None
 
@@ -201,6 +217,7 @@ class ExecutionEngine:
                 logger.debug(f"Multiquotes failed: {response.get('message', 'Unknown error')}")
 
         except Exception as e:
+            _rollback_sandbox_session()
             logger.debug(f"Exception in multiquotes fetch: {str(e)}")
 
         return quote_cache
@@ -296,6 +313,7 @@ class ExecutionEngine:
                 self._execute_order(order, execution_price)
 
         except Exception as e:
+            _rollback_sandbox_session()
             logger.exception(f"Error processing order {order.orderid}: {e}")
 
     def _execute_order(self, order, execution_price):
@@ -340,9 +358,18 @@ class ExecutionEngine:
             self._update_position(order, execution_price)
 
             logger.info(f"Order {order.orderid} executed successfully. Trade ID: {tradeid}")
+            logger.info(
+                "[LEDGER DEBUG] sandbox trade persisted: tradeid=%s orderid=%s user=%s symbol=%s price=%s quantity=%s",
+                tradeid,
+                order.orderid,
+                order.user_id,
+                order.symbol,
+                execution_price,
+                order.quantity,
+            )
 
         except Exception as e:
-            db_session.rollback()
+            _rollback_sandbox_session()
             logger.exception(f"Error executing order {order.orderid}: {e}")
 
             # Mark order as rejected
@@ -351,8 +378,9 @@ class ExecutionEngine:
                 order.rejection_reason = f"Execution error: {str(e)}"
                 order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
                 db_session.commit()
-            except:
-                db_session.rollback()
+            except Exception as inner_e:
+                logger.debug(f"Error marking order {order.orderid} rejected: {inner_e}")
+                _rollback_sandbox_session()
 
     def _update_position(self, order, execution_price):
         """
@@ -596,6 +624,15 @@ class ExecutionEngine:
                     )
 
             db_session.commit()
+            logger.info(
+                "[LEDGER DEBUG] sandbox position persisted: user=%s symbol=%s exchange=%s product=%s quantity=%s avg_price=%s",
+                order.user_id,
+                position.symbol,
+                position.exchange,
+                position.product,
+                position.quantity,
+                position.average_price,
+            )
 
             # Validate margin consistency after position update
             is_consistent, discrepancy = validate_margin_consistency(order.user_id)
@@ -608,7 +645,7 @@ class ExecutionEngine:
                 reconcile_margin(order.user_id, auto_fix=True)
 
         except Exception as e:
-            db_session.rollback()
+            _rollback_sandbox_session()
             logger.exception(f"Error updating position for order {order.orderid}: {e}")
             raise
 
@@ -630,6 +667,7 @@ class ExecutionEngine:
             return pnl
 
         except Exception as e:
+            _rollback_sandbox_session()
             logger.exception(f"Error calculating realized P&L: {e}")
             return Decimal("0.00")
 
@@ -666,4 +704,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Execution engine stopped by user")
     except Exception as e:
+        _rollback_sandbox_session()
         logger.exception(f"Execution engine error: {e}")

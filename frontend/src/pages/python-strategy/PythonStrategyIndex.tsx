@@ -17,6 +17,7 @@ import {
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { showToast } from '@/utils/toast'
+import { formatIstDateTime } from '@/utils/time'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -224,7 +225,7 @@ export default function PythonStrategyIndex() {
 
   const formatTime = (timeStr: string | null) => {
     if (!timeStr) return '-'
-    return new Date(timeStr).toLocaleString('en-IN', {
+    return formatIstDateTime(timeStr, {
       day: '2-digit',
       month: 'short',
       hour: '2-digit',

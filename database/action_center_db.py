@@ -2,29 +2,23 @@
 
 import json
 import os
-from datetime import datetime
 
-import pytz
-from sqlalchemy import Column, DateTime, Index, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Index, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
 from sqlalchemy.sql import func
 
+from utils.database_config import create_engine_from_env
 from utils.logging import get_logger
+from utils.timezone import now_ist
 
 # Initialize logger
 logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Conditionally create engine based on DB type
-if DATABASE_URL and "sqlite" in DATABASE_URL:
-    engine = create_engine(
-        DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    engine = create_engine(DATABASE_URL, pool_size=50, max_overflow=100, pool_timeout=10)
+engine = create_engine_from_env(
+    "DATABASE_URL", default_prefix="DB", pool_size=50, max_overflow=100, pool_timeout=10
+)
 
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
@@ -34,13 +28,10 @@ Base.query = db_session.query_property()
 def get_ist_timestamp():
     """Get current timestamp in IST format"""
     try:
-        utc_now = datetime.now(pytz.UTC)
-        ist = pytz.timezone("Asia/Kolkata")
-        ist_now = utc_now.astimezone(ist)
-        return ist_now.strftime("%Y-%m-%d %H:%M:%S IST")
+        return now_ist().strftime("%Y-%m-%d %H:%M:%S IST")
     except Exception as e:
         logger.exception(f"Error getting IST timestamp: {e}")
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+        return now_ist().strftime("%Y-%m-%d %H:%M:%S IST")
 
 
 class PendingOrder(Base):
@@ -186,7 +177,7 @@ def approve_pending_order(order_id, approved_by, user_id):
         if pending_order:
             pending_order.status = "approved"
             pending_order.approved_by = approved_by
-            pending_order.approved_at = datetime.utcnow()
+            pending_order.approved_at = now_ist()
             pending_order.approved_at_ist = get_ist_timestamp()
             db_session.commit()
 
@@ -226,7 +217,7 @@ def reject_pending_order(order_id, reason, rejected_by, user_id):
             pending_order.status = "rejected"
             pending_order.rejected_reason = reason
             pending_order.rejected_by = rejected_by
-            pending_order.rejected_at = datetime.utcnow()
+            pending_order.rejected_at = now_ist()
             pending_order.rejected_at_ist = get_ist_timestamp()
             db_session.commit()
 

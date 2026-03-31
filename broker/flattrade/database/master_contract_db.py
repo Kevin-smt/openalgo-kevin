@@ -3,10 +3,11 @@ from datetime import datetime
 
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from utils.database_config import bulk_insert_mappings_chunked, create_engine_from_env
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -19,7 +20,7 @@ except ImportError:
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
-engine = create_engine(DATABASE_URL)
+engine = create_engine_from_env("DATABASE_URL", default_prefix="DB")
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -48,12 +49,6 @@ class SymToken(Base):
 def init_db():
     """Initialize the database and create tables"""
     logger.info("Initializing Master Contract DB")
-
-    # Create database directory if it doesn't exist
-    db_path = os.path.dirname(DATABASE_URL.replace("sqlite:///", ""))
-    if db_path and not os.path.exists(db_path):
-        os.makedirs(db_path)
-
     Base.metadata.create_all(bind=engine)
 
 
@@ -70,37 +65,23 @@ def copy_from_dataframe(df):
 
     # Retrieve existing tokens to filter them out from the insert
     existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
     # Filter out data_dict entries with tokens that already exist
     filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
-            db_session.commit()
-            logger.info(
-                f"Bulk insert completed successfully with {len(filtered_data_dict)} new records."
-            )
-        else:
-            logger.info("No new records to insert.")
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "500")),
+            logger=logger,
+            label="Master contract",
+        )
     except Exception as e:
-        logger.error(f"Error during bulk insert: {e}")
-        db_session.rollback()
-
-
-# Define the Flattrade URLs for downloading the symbol files
-flattrade_urls = {
-    "NSE": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/NSE_Equity.csv",
-    "NFO_EQ": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/Nfo_Equity_Derivatives.csv",
-    "NFO_IDX": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/Nfo_Index_Derivatives.csv",
-    "CDS": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/Currency_Derivatives.csv",
-    "MCX": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/Commodity.csv",
-    "BSE": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/BSE_Equity.csv",
-    "BFO_IDX": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/Bfo_Index_Derivatives.csv",
-    "BFO_EQ": "https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/Bfo_Equity_Derivatives.csv",
-}
-
+        logger.exception(f"Error during bulk insert: {e}")
+        raise
 
 def download_csv_data(output_path):
     """

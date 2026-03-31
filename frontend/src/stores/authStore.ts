@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { nowIstIso } from '@/utils/time'
 
 interface User {
   username: string
@@ -36,7 +37,7 @@ export const useAuthStore = create<AuthStore>()(
           username,
           broker,
           isLoggedIn: true,
-          loginTime: new Date().toISOString(),
+          loginTime: nowIstIso(),
         }
         set({ user, isAuthenticated: true })
       },

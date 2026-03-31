@@ -25,31 +25,13 @@ def get_permission_checks():
     This allows database paths to be configured in .env file.
     """
 
-    # Extract database paths from environment variables
-    # Format: 'sqlite:///db/openalgo.db' -> 'db/openalgo.db'
-    def extract_db_path(env_var, default):
-        value = os.getenv(env_var, default)
-        if value.startswith("sqlite:///"):
-            return value[len("sqlite:///") :]
-        return value
-
-    main_db = extract_db_path("DATABASE_URL", "db/openalgo.db")
-    latency_db = extract_db_path("LATENCY_DATABASE_URL", "db/latency.db")
-    logs_db = extract_db_path("LOGS_DATABASE_URL", "db/logs.db")
-    sandbox_db = extract_db_path("SANDBOX_DATABASE_URL", "db/sandbox.db")
+    # PostgreSQL databases are not file-backed, so database files are not checked.
     historify_db = os.getenv("HISTORIFY_DATABASE_URL", "db/historify.duckdb")
-
-    # Extract db directory from main database path
-    db_dir = os.path.dirname(main_db) if main_db else "db"
 
     # Define expected permissions for each path
     # Format: (relative_path, expected_unix_mode, description, is_sensitive)
-    return [
-        (db_dir, 0o755, "Database directory", False),
-        (main_db, 0o644, "Main database file (SQLite)", False),
-        (latency_db, 0o644, "Latency database file (SQLite)", False),
-        (logs_db, 0o644, "Logs database file (SQLite)", False),
-        (sandbox_db, 0o644, "Sandbox database file (SQLite)", False),
+    checks = [
+        ("db", 0o755, "Database directory", False),
         (historify_db, 0o644, "Historical data database (DuckDB)", False),
         (".env", 0o600, "Environment configuration (sensitive)", True),
         ("log", 0o755, "Log directory", False),
@@ -60,6 +42,8 @@ def get_permission_checks():
         ("strategies/examples", 0o755, "Strategy examples directory", False),
         ("tmp", 0o755, "Temporary files directory", False),
     ]
+
+    return [check for check in checks if check is not None]
 
 
 def get_base_path():

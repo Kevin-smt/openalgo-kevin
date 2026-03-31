@@ -6,6 +6,7 @@ Handles scheduled historical data downloads using APScheduler (Flask/sync versio
 
 import os
 import threading
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,16 @@ from apscheduler.triggers.interval import IntervalTrigger
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _app_context_or_null():
+    """Return a Flask app context when available, otherwise a no-op context."""
+    try:
+        from app import app as flask_app
+
+        return flask_app.app_context()
+    except Exception:
+        return nullcontext()
 
 
 class HistorifyScheduler:
@@ -46,7 +57,7 @@ class HistorifyScheduler:
                 return
 
             if db_url is None:
-                db_url = os.getenv("DATABASE_URL", "sqlite:///db/openalgo.db")
+                db_url = os.getenv("DATABASE_URL")
 
             self._api_key = api_key
             self._socketio = socketio
@@ -507,95 +518,96 @@ def execute_schedule(schedule_id: str, api_key: str = None):
     execution_id = None
 
     try:
-        # Get schedule configuration
-        schedule = get_schedule(schedule_id)
-        if not schedule:
-            logger.error(f"Schedule not found: {schedule_id}")
-            return
+        with _app_context_or_null():
+            # Get schedule configuration
+            schedule = get_schedule(schedule_id)
+            if not schedule:
+                logger.error(f"Schedule not found: {schedule_id}")
+                return
 
-        if not schedule.get("is_enabled", False) or schedule.get("is_paused", False):
-            logger.info(f"Schedule {schedule_id} is disabled or paused, skipping")
-            return
+            if not schedule.get("is_enabled", False) or schedule.get("is_paused", False):
+                logger.info(f"Schedule {schedule_id} is disabled or paused, skipping")
+                return
 
-        # Update status to running
-        update_schedule(schedule_id, status="running")
+            # Update status to running
+            update_schedule(schedule_id, status="running")
 
-        # Get API key - prefer from parameter, then scheduler instance, then database
-        effective_api_key = api_key
-        if not effective_api_key:
-            scheduler = get_historify_scheduler()
-            effective_api_key = scheduler.api_key
+            # Get API key - prefer from parameter, then scheduler instance, then database
+            effective_api_key = api_key
+            if not effective_api_key:
+                scheduler = get_historify_scheduler()
+                effective_api_key = scheduler.api_key
 
-        # If still no API key, get from database (for background service)
-        if not effective_api_key:
-            effective_api_key = get_first_available_api_key()
+            # If still no API key, get from database (for background service)
+            if not effective_api_key:
+                effective_api_key = get_first_available_api_key()
 
-        if not effective_api_key:
-            logger.error(
-                f"No API key available for schedule {schedule_id}. Please generate an API key first."
+            if not effective_api_key:
+                logger.error(
+                    f"No API key available for schedule {schedule_id}. Please generate an API key first."
+                )
+                update_schedule(schedule_id, status="idle", last_run_status="no_api_key")
+                return
+
+            # Get symbols from watchlist (scheduler only supports watchlist)
+            watchlist = get_watchlist()
+            symbols = [{"symbol": item["symbol"], "exchange": item["exchange"]} for item in watchlist]
+
+            if not symbols:
+                logger.warning(f"No symbols found for schedule {schedule_id}")
+                update_schedule(schedule_id, status="idle", last_run_status="no_symbols")
+                return
+
+            # Calculate date range
+            lookback_days = schedule.get("lookback_days", 1)
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+            # Create execution record
+            execution_id = create_schedule_execution(schedule_id)
+
+            # Create and start the download job (always incremental for scheduled downloads)
+            success, response, status_code = create_and_start_job(
+                job_type="scheduled",
+                symbols=symbols,
+                interval=schedule.get("data_interval", "D"),
+                start_date=start_date,
+                end_date=end_date,
+                api_key=effective_api_key,
+                config={"schedule_id": schedule_id},
+                incremental=True,
             )
-            update_schedule(schedule_id, status="idle", last_run_status="no_api_key")
-            return
 
-        # Get symbols from watchlist (scheduler only supports watchlist)
-        watchlist = get_watchlist()
-        symbols = [{"symbol": item["symbol"], "exchange": item["exchange"]} for item in watchlist]
+            if success:
+                job_id = response.get("job_id")
+                if execution_id:
+                    update_schedule_execution(
+                        execution_id, download_job_id=job_id, symbols_processed=len(symbols)
+                    )
+                update_schedule(schedule_id, status="idle", last_run_status="success")
+                increment_schedule_run_counts(schedule_id, is_success=True)
+                logger.info(f"Scheduled download started: {job_id} ({len(symbols)} symbols)")
 
-        if not symbols:
-            logger.warning(f"No symbols found for schedule {schedule_id}")
-            update_schedule(schedule_id, status="idle", last_run_status="no_symbols")
-            return
+                # Emit Socket.IO event
+                scheduler = get_historify_scheduler()
+                if scheduler.socketio:
+                    scheduler.socketio.emit(
+                        "historify_schedule_execution_started",
+                        {"schedule_id": schedule_id, "execution_id": execution_id, "job_id": job_id},
+                    )
 
-        # Calculate date range
-        lookback_days = schedule.get("lookback_days", 1)
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-
-        # Create execution record
-        execution_id = create_schedule_execution(schedule_id)
-
-        # Create and start the download job (always incremental for scheduled downloads)
-        success, response, status_code = create_and_start_job(
-            job_type="scheduled",
-            symbols=symbols,
-            interval=schedule.get("data_interval", "D"),
-            start_date=start_date,
-            end_date=end_date,
-            api_key=effective_api_key,
-            config={"schedule_id": schedule_id},
-            incremental=True,
-        )
-
-        if success:
-            job_id = response.get("job_id")
-            if execution_id:
-                update_schedule_execution(
-                    execution_id, download_job_id=job_id, symbols_processed=len(symbols)
-                )
-            update_schedule(schedule_id, status="idle", last_run_status="success")
-            increment_schedule_run_counts(schedule_id, is_success=True)
-            logger.info(f"Scheduled download started: {job_id} ({len(symbols)} symbols)")
-
-            # Emit Socket.IO event
-            scheduler = get_historify_scheduler()
-            if scheduler.socketio:
-                scheduler.socketio.emit(
-                    "historify_schedule_execution_started",
-                    {"schedule_id": schedule_id, "execution_id": execution_id, "job_id": job_id},
-                )
-
-        else:
-            error_msg = response.get("message", "Unknown error")
-            if execution_id:
-                update_schedule_execution(
-                    execution_id,
-                    status="failed",
-                    completed_at=datetime.now(),
-                    error_message=error_msg,
-                )
-            update_schedule(schedule_id, status="idle", last_run_status="failed")
-            increment_schedule_run_counts(schedule_id, is_success=False)
-            logger.error(f"Scheduled download failed: {error_msg}")
+            else:
+                error_msg = response.get("message", "Unknown error")
+                if execution_id:
+                    update_schedule_execution(
+                        execution_id,
+                        status="failed",
+                        completed_at=datetime.now(),
+                        error_message=error_msg,
+                    )
+                update_schedule(schedule_id, status="idle", last_run_status="failed")
+                increment_schedule_run_counts(schedule_id, is_success=False)
+                logger.error(f"Scheduled download failed: {error_msg}")
 
     except Exception as e:
         logger.exception(f"Error executing schedule {schedule_id}: {e}")

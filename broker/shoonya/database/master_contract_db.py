@@ -5,19 +5,20 @@ from datetime import datetime
 
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from extensions import socketio  # Import SocketIO
 from utils.logging import get_logger
+from utils.database_config import bulk_insert_mappings_chunked, get_engine
 
 logger = get_logger(__name__)
 
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
-engine = create_engine(DATABASE_URL)
+engine = get_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -59,42 +60,25 @@ def copy_from_dataframe(df):
     # Convert DataFrame to a list of dictionaries
     data_dict = df.to_dict(orient="records")
 
-    # Retrieve existing token-exchange combinations to filter them out from the insert
-    existing_token_exchange = {
-        (result.token, result.exchange)
-        for result in db_session.query(SymToken.token, SymToken.exchange).all()
-    }
+    # Retrieve existing tokens to filter them out from the insert
+    existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
-    # Filter out data_dict entries with token-exchange combinations that already exist
-    filtered_data_dict = [
-        row for row in data_dict if (row["token"], row["exchange"]) not in existing_token_exchange
-    ]
+    # Filter out data_dict entries with tokens that already exist
+    filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
-            db_session.commit()
-            logger.info(
-                f"Bulk insert completed successfully with {len(filtered_data_dict)} new records."
-            )
-        else:
-            logger.info("No new records to insert.")
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "500")),
+            logger=logger,
+            label="Master contract",
+        )
     except Exception as e:
-        logger.error(f"Error during bulk insert: {e}")
-        db_session.rollback()
-
-
-# Define the shoonya URLs for downloading the symbol files
-shoonya_urls = {
-    "NSE": "https://api.shoonya.com/NSE_symbols.txt.zip",
-    "NFO": "https://api.shoonya.com/NFO_symbols.txt.zip",
-    "CDS": "https://api.shoonya.com/CDS_symbols.txt.zip",
-    "MCX": "https://api.shoonya.com/MCX_symbols.txt.zip",
-    "BSE": "https://api.shoonya.com/BSE_symbols.txt.zip",
-    "BFO": "https://api.shoonya.com/BFO_symbols.txt.zip",
-}
-
+        logger.exception(f"Error during bulk insert: {e}")
+        raise
 
 def download_and_unzip_shoonya_data(output_path):
     """

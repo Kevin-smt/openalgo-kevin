@@ -16,6 +16,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from database.auth_db import get_auth_token
 from extensions import socketio  # Import SocketIO
 from utils.logging import get_logger
+from utils.database_config import bulk_insert_mappings_chunked, get_engine
 
 logger = get_logger(__name__)
 
@@ -24,7 +25,7 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv('DATABASE_URL')  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = get_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -59,26 +60,27 @@ def delete_symtoken_table():
 def copy_from_dataframe(df):
     logger.info("Performing Bulk Insert")
     # Convert DataFrame to a list of dictionaries
-    data_dict = df.to_dict(orient='records')
+    data_dict = df.to_dict(orient="records")
 
     # Retrieve existing tokens to filter them out from the insert
     existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
     # Filter out data_dict entries with tokens that already exist
-    filtered_data_dict = [row for row in data_dict if row['token'] not in existing_tokens]
+    filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
-            db_session.commit()
-            logger.info(f"Bulk insert completed successfully with {len(filtered_data_dict)} new records.")
-        else:
-            logger.info("No new records to insert.")
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "500")),
+            logger=logger,
+            label="Master contract",
+        )
     except Exception as e:
-        logger.error(f"Error during bulk insert: {e}")
-        db_session.rollback()
-
+        logger.exception(f"Error during bulk insert: {e}")
+        raise
 
 def download_csv_zerodha_data(output_path):
     """

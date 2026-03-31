@@ -8,6 +8,7 @@ Uses polling instead of WebSocket for simplicity in Flask context
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
@@ -15,6 +16,16 @@ from typing import Any, Dict, Optional, Set
 from services.flow_openalgo_client import FlowOpenAlgoClient, get_flow_client
 
 logger = logging.getLogger(__name__)
+
+
+def _app_context_or_null():
+    """Return a Flask app context when available, otherwise a no-op context."""
+    try:
+        from app import app as flask_app
+
+        return flask_app.app_context()
+    except Exception:
+        return nullcontext()
 
 
 @dataclass
@@ -277,8 +288,13 @@ class FlowPriceMonitor:
                     "triggered_at": datetime.now().isoformat(),
                 }
 
-                result = execute_workflow(workflow_id, webhook_data=webhook_data, api_key=api_key)
-                logger.info(f"Workflow {workflow_id} execution result: {result.get('status')}")
+                with _app_context_or_null():
+                    result = execute_workflow(
+                        workflow_id, webhook_data=webhook_data, api_key=api_key
+                    )
+                    logger.info(
+                        f"Workflow {workflow_id} execution result: {result.get('status')}"
+                    )
 
             except Exception as e:
                 logger.exception(f"Failed to execute workflow {workflow_id}: {e}")
