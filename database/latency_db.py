@@ -3,29 +3,16 @@ import os
 from datetime import timedelta
 
 from sqlalchemy import JSON, Column, DateTime, Float, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.sql import func
 
-from utils.database_config import SMALL_POOL_CONFIG, create_engine_from_env
+from database.db import Base, Session, engine
+from utils.async_db_logger import async_log
 from utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
-# Use a separate database for latency logs
-LATENCY_DATABASE_URL = os.getenv("LATENCY_DATABASE_URL", "")
-latency_engine = create_engine_from_env(
-    "LATENCY_DATABASE_URL",
-    default_prefix="LATENCY_DB",
-    fallback_url=os.getenv("DATABASE_URL"),
-    pool_config=SMALL_POOL_CONFIG,
-)
-
-latency_session = scoped_session(
-    sessionmaker(autocommit=False, autoflush=False, bind=latency_engine)
-)
-LatencyBase = declarative_base()
-LatencyBase.query = latency_session.query_property()
+latency_session = Session
+LatencyBase = Base
 
 
 class OrderLatency(LatencyBase):
@@ -34,12 +21,12 @@ class OrderLatency(LatencyBase):
     __tablename__ = "order_latency"
 
     id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    order_id = Column(String(100), nullable=False)
-    user_id = Column(Integer)
-    broker = Column(String(50))
-    symbol = Column(String(50))
-    order_type = Column(String(20))  # MARKET, LIMIT, etc.
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    order_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, index=True)
+    broker = Column(String(50), index=True)
+    symbol = Column(String(50), index=True)
+    order_type = Column(String(20), index=True)  # MARKET, LIMIT, etc.
 
     # Round-trip time (comparable to Postman/Bruno)
     rtt_ms = Column(Float)
@@ -73,29 +60,52 @@ class OrderLatency(LatencyBase):
     ):
         """Log order execution latency"""
         try:
-            log = OrderLatency(
-                order_id=order_id,
-                user_id=user_id,
-                broker=broker,
-                symbol=symbol,
-                order_type=order_type,
-                rtt_ms=latencies.get("rtt", 0),
-                validation_latency_ms=latencies.get("validation", 0),
-                response_latency_ms=latencies.get("broker_response", 0),
-                overhead_ms=latencies.get("overhead", 0),
-                total_latency_ms=latencies.get("total", 0),
-                request_body=request_body,
-                response_body=response_body,
-                status=status,
-                error=error,
+            async_log(
+                OrderLatency,
+                {
+                    "order_id": order_id,
+                    "user_id": user_id,
+                    "broker": broker,
+                    "symbol": symbol,
+                    "order_type": order_type,
+                    "rtt_ms": latencies.get("rtt", 0),
+                    "validation_latency_ms": latencies.get("validation", 0),
+                    "response_latency_ms": latencies.get("broker_response", 0),
+                    "overhead_ms": latencies.get("overhead", 0),
+                    "total_latency_ms": latencies.get("total", 0),
+                    "request_body": request_body,
+                    "response_body": response_body,
+                    "status": status,
+                    "error": error,
+                },
             )
-            latency_session.add(log)
-            latency_session.commit()
             return True
         except Exception as e:
-            logger.exception(f"Error logging latency: {str(e)}")
-            latency_session.rollback()
-            return False
+            logger.exception(f"Error queueing latency log: {str(e)}")
+            try:
+                log = OrderLatency(
+                    order_id=order_id,
+                    user_id=user_id,
+                    broker=broker,
+                    symbol=symbol,
+                    order_type=order_type,
+                    rtt_ms=latencies.get("rtt", 0),
+                    validation_latency_ms=latencies.get("validation", 0),
+                    response_latency_ms=latencies.get("broker_response", 0),
+                    overhead_ms=latencies.get("overhead", 0),
+                    total_latency_ms=latencies.get("total", 0),
+                    request_body=request_body,
+                    response_body=response_body,
+                    status=status,
+                    error=error,
+                )
+                latency_session.add(log)
+                latency_session.commit()
+                return True
+            except Exception as sync_error:
+                logger.exception(f"Error logging latency synchronously: {str(sync_error)}")
+                latency_session.rollback()
+                return False
 
     @staticmethod
     def get_recent_logs(limit=100):
@@ -271,7 +281,7 @@ def init_latency_db():
     """Initialize the latency database"""
     from database.db_init_helper import init_db_with_logging
 
-    init_db_with_logging(LatencyBase, latency_engine, "Latency DB", logger)
+    init_db_with_logging(LatencyBase, engine, "Latency DB", logger)
 
 
 def purge_old_data_logs(days=7):

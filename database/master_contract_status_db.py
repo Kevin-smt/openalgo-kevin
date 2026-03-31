@@ -4,10 +4,8 @@ import os
 from datetime import date, timedelta
 
 from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, Text, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 
-from utils.database_config import create_engine_from_env
+from database.db import Base, Session, engine
 from utils.timezone import ensure_ist, now_ist
 
 
@@ -20,17 +18,7 @@ DOWNLOAD_TIMEOUT_MINUTES = 5
 
 # Get the database path from environment variable or use default
 DB_PATH = os.getenv("DATABASE_URL", "")
-engine = create_engine_from_env(
-    "DATABASE_URL",
-    default_prefix="DB",
-    echo=False,
-    pool_size=50,
-    max_overflow=100,
-    pool_timeout=10,
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
+SessionLocal = Session
 
 
 class MasterContractStatus(Base):

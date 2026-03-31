@@ -1,10 +1,7 @@
 import json
 import logging
 import os
-import atexit
-import queue
 import threading
-import time
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -19,48 +16,30 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.sql import func
 
 from database.settings_db import get_security_settings
-from utils.database_config import SMALL_POOL_CONFIG, create_engine_from_env
+from database.db import Base, Session, engine
+from utils.async_db_logger import async_log, get_queue_status as get_async_queue_status
 from utils.timezone import ensure_ist, now_ist
 
 logger = logging.getLogger(__name__)
 
-# Use a separate database for logs
-LOGS_DATABASE_URL = os.getenv("LOGS_DATABASE_URL", "")
-LOGS_POOL_CONFIG = SMALL_POOL_CONFIG
-logs_engine = create_engine_from_env(
-    "LOGS_DATABASE_URL",
-    default_prefix="LOGS_DB",
-    fallback_url=os.getenv("DATABASE_URL"),
-    pool_config=LOGS_POOL_CONFIG,
-)
+logs_session = Session
+LogBase = Base
+logs_engine = engine
 
-LogsSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=logs_engine)
-logs_session = scoped_session(LogsSessionLocal)
-LogBase = declarative_base()
-LogBase.query = logs_session.query_property()
-
-_TRAFFIC_WRITE_QUEUE: queue.Queue[dict[str, object] | object] = queue.Queue(maxsize=10000)
-_TRAFFIC_QUEUE_STOP = None
 _BAN_CACHE = TTLCache(maxsize=1000, ttl=60)
 _RECENT_LOGS_CACHE = TTLCache(maxsize=16, ttl=10)
 _TRAFFIC_STATS_CACHE = TTLCache(maxsize=16, ttl=30)
 _BAN_LIST_CACHE = TTLCache(maxsize=16, ttl=60)
 _BAN_CACHE_LOCK = threading.Lock()
 _REPORT_CACHE_LOCK = threading.Lock()
-_TRAFFIC_WORKER_STARTED = False
-_TRAFFIC_WORKER_THREAD: threading.Thread | None = None
-_TRAFFIC_WORKER_LOCK = threading.Lock()
 
 
 @contextmanager
 def _logs_session_scope():
-    """Open a dedicated logs session and always return it to the pool."""
-    session = LogsSessionLocal()
+    session = logs_session()
     try:
         yield session
         session.commit()
@@ -69,8 +48,6 @@ def _logs_session_scope():
         raise
     finally:
         session.close()
-
-
 def _set_ban_cache(ip_address: str, value: bool) -> None:
     with _BAN_CACHE_LOCK:
         _BAN_CACHE[ip_address] = value
@@ -81,14 +58,6 @@ def _get_ban_cache(ip_address: str) -> tuple[bool, bool]:
         if ip_address in _BAN_CACHE:
             return True, bool(_BAN_CACHE[ip_address])
     return False, False
-
-
-def _enqueue_traffic_event(event: dict[str, object]) -> bool:
-    try:
-        _TRAFFIC_WRITE_QUEUE.put_nowait(event)
-        return True
-    except queue.Full:
-        return False
 
 
 def _invalidate_traffic_read_caches() -> None:
@@ -171,85 +140,9 @@ def _write_invalid_api_key_tracker(session, event: dict[str, object]) -> None:
         )
 
 
-def _write_traffic_event(event: dict[str, object]) -> None:
-    kind = event.get("kind")
-    with _logs_session_scope() as session:
-        if kind == "traffic_log":
-            _write_traffic_log(session, event)
-        elif kind == "track_404":
-            _write_404_tracker(session, event)
-        elif kind == "track_invalid_api_key":
-            _write_invalid_api_key_tracker(session, event)
-    _invalidate_traffic_read_caches()
-
-
-def _traffic_write_worker():
-    """Background worker that writes traffic events without blocking requests."""
-    while True:
-        try:
-            event = _TRAFFIC_WRITE_QUEUE.get(timeout=1)
-        except queue.Empty:
-            continue
-
-        if event is _TRAFFIC_QUEUE_STOP:
-            _TRAFFIC_WRITE_QUEUE.task_done()
-            break
-
-        try:
-            _write_traffic_event(event)  # type: ignore[arg-type]
-        except Exception as exc:
-            logger.exception(f"Traffic write worker error: {exc}")
-        finally:
-            _TRAFFIC_WRITE_QUEUE.task_done()
-
-
-def _ensure_traffic_worker_started() -> None:
-    global _TRAFFIC_WORKER_STARTED
-    global _TRAFFIC_WORKER_THREAD
-    if _TRAFFIC_WORKER_STARTED:
-        return
-    with _TRAFFIC_WORKER_LOCK:
-        if _TRAFFIC_WORKER_STARTED and _TRAFFIC_WORKER_THREAD and _TRAFFIC_WORKER_THREAD.is_alive():
-            return
-        _TRAFFIC_WORKER_STARTED = True
-        _TRAFFIC_WORKER_THREAD = threading.Thread(
-            target=_traffic_write_worker, name="TrafficLogWorker", daemon=True
-        )
-        _TRAFFIC_WORKER_THREAD.start()
-
-
-def _ensure_worker_running() -> bool:
-    """Restart the log worker if it has died."""
-    global _TRAFFIC_WORKER_THREAD
-    _ensure_traffic_worker_started()
-    if _TRAFFIC_WORKER_THREAD is None:
-        return False
-    if _TRAFFIC_WORKER_THREAD.is_alive():
-        return True
-
-    with _TRAFFIC_WORKER_LOCK:
-        if _TRAFFIC_WORKER_THREAD is not None and _TRAFFIC_WORKER_THREAD.is_alive():
-            return True
-        logger.warning("Log worker thread died - restarting")
-        _TRAFFIC_WORKER_THREAD = threading.Thread(
-            target=_traffic_write_worker, name="TrafficLogWorker", daemon=True
-        )
-        _TRAFFIC_WORKER_THREAD.start()
-        return True
-
-
 def get_queue_status() -> dict[str, object]:
     """Return current traffic log queue health."""
-    depth = _TRAFFIC_WRITE_QUEUE.qsize()
-    maxsize = _TRAFFIC_WRITE_QUEUE.maxsize or 0
-    pct = (depth / maxsize) if maxsize else 0.0
-    worker_alive = bool(_TRAFFIC_WORKER_THREAD and _TRAFFIC_WORKER_THREAD.is_alive())
-    return {
-        "log_queue_depth": depth,
-        "log_queue_maxsize": maxsize,
-        "log_queue_pct": round(pct, 4),
-        "worker_alive": worker_alive,
-    }
+    return get_async_queue_status()
 
 
 def log_queue_status() -> dict[str, object]:
@@ -264,30 +157,6 @@ def log_queue_status() -> dict[str, object]:
     else:
         logger.info(message)
     return status
-
-
-def _shutdown_log_worker() -> None:
-    """Best-effort flush of queued log events on process shutdown."""
-    try:
-        depth = _TRAFFIC_WRITE_QUEUE.qsize()
-        logger.info(f"Flushing log queue ({depth} items) before shutdown...")
-        deadline = time.monotonic() + 5.0
-        while _TRAFFIC_WRITE_QUEUE.unfinished_tasks > 0 and time.monotonic() < deadline:
-            time.sleep(0.05)
-
-        if _TRAFFIC_WRITE_QUEUE.unfinished_tasks == 0:
-            try:
-                _TRAFFIC_WRITE_QUEUE.put_nowait(_TRAFFIC_QUEUE_STOP)
-            except queue.Full:
-                pass
-            logger.info("Log queue flushed")
-        else:
-            logger.warning("Log queue flush timed out after 5 seconds; continuing shutdown")
-    except Exception as exc:
-        logger.warning(f"Log worker shutdown skipped: {exc}")
-
-
-atexit.register(_shutdown_log_worker)
 
 
 class TrafficLog(LogBase):
@@ -320,19 +189,42 @@ class TrafficLog(LogBase):
         client_ip, method, path, status_code, duration_ms, host=None, error=None, user_id=None
     ):
         """Queue a request log so request threads never block on writes."""
-        return _enqueue_traffic_event(
-            {
-                "kind": "traffic_log",
-                "client_ip": client_ip,
-                "method": method,
-                "path": path,
-                "status_code": status_code,
-                "duration_ms": duration_ms,
-                "host": host,
-                "error": error,
-                "user_id": user_id,
-            }
-        )
+        try:
+            async_log(
+                TrafficLog,
+                {
+                    "client_ip": client_ip,
+                    "method": method,
+                    "path": path,
+                    "status_code": status_code,
+                    "duration_ms": duration_ms,
+                    "host": host,
+                    "error": error,
+                    "user_id": user_id,
+                },
+            )
+            return True
+        except Exception:
+            try:
+                with _logs_session_scope() as session:
+                    _write_traffic_log(
+                        session,
+                        {
+                            "client_ip": client_ip,
+                            "method": method,
+                            "path": path,
+                            "status_code": status_code,
+                            "duration_ms": duration_ms,
+                            "host": host,
+                            "error": error,
+                            "user_id": user_id,
+                        },
+                    )
+                _invalidate_traffic_read_caches()
+                return True
+            except Exception as e:
+                logger.exception(f"Error logging traffic: {e}")
+                return False
 
     @staticmethod
     def get_recent_logs(limit=100):
@@ -558,7 +450,10 @@ class Error404Tracker(LogBase):
         try:
             if IPBan.is_ip_banned(ip_address):
                 return False
-            return _enqueue_traffic_event({"kind": "track_404", "ip_address": ip_address, "path": path})
+            with _logs_session_scope() as session:
+                _write_404_tracker(session, {"ip_address": ip_address, "path": path})
+            _invalidate_traffic_read_caches()
+            return True
         except Exception as e:
             logger.exception(f"Error tracking 404: {e}")
             return False
@@ -610,13 +505,16 @@ class InvalidAPIKeyTracker(LogBase):
         try:
             if IPBan.is_ip_banned(ip_address):
                 return False
-            return _enqueue_traffic_event(
-                {
-                    "kind": "track_invalid_api_key",
-                    "ip_address": ip_address,
-                    "api_key_hash": api_key_hash,
-                }
-            )
+            with _logs_session_scope() as session:
+                _write_invalid_api_key_tracker(
+                    session,
+                    {
+                        "ip_address": ip_address,
+                        "api_key_hash": api_key_hash,
+                    },
+                )
+            _invalidate_traffic_read_caches()
+            return True
         except Exception as e:
             logger.exception(f"Error tracking invalid API key: {e}")
             return False
@@ -650,6 +548,3 @@ def init_logs_db():
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(LogBase, logs_engine, "Traffic Logs DB", logger)
-
-
-_ensure_traffic_worker_started()

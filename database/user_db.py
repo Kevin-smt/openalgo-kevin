@@ -6,12 +6,10 @@ import pyotp
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from cachetools import TTLCache
-from sqlalchemy import Boolean, Column, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, Integer, String
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
 
-from utils.database_config import create_engine_from_env
+from database.db import Base, Session, engine
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,17 +37,7 @@ if len(_pepper_value) < 32:
 PASSWORD_PEPPER = _pepper_value
 
 # Engine and session setup
-engine = create_engine_from_env(
-    "DATABASE_URL",
-    default_prefix="DB",
-    echo=False,
-    pool_size=50,
-    max_overflow=100,
-    pool_timeout=10,
-)
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+db_session = Session
 
 # Define a cache for the usernames with a max size and a 30-second TTL
 username_cache = TTLCache(maxsize=1024, ttl=30)
@@ -58,8 +46,8 @@ username_cache = TTLCache(maxsize=1024, ttl=30)
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    username = Column(String(80), unique=True, nullable=False)
-    email = Column(String(120), unique=True, nullable=False)
+    username = Column(String(80), unique=True, nullable=False, index=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)  # Increased length for Argon2 hash
     totp_secret = Column(String(32), nullable=False)  # For TOTP-based password reset
     is_admin = Column(Boolean, default=False)

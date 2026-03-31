@@ -19,29 +19,15 @@ import os
 from datetime import timedelta
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.sql import func
 
-from utils.database_config import SMALL_POOL_CONFIG, create_engine_from_env
+from database.db import Base, Session, engine
 from utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
-# Use a separate database for health monitoring
-HEALTH_DATABASE_URL = os.getenv("HEALTH_DATABASE_URL", "")
-health_engine = create_engine_from_env(
-    "HEALTH_DATABASE_URL",
-    default_prefix="HEALTH_DB",
-    fallback_url=os.getenv("DATABASE_URL"),
-    pool_config=SMALL_POOL_CONFIG,
-)
-
-health_session = scoped_session(
-    sessionmaker(autocommit=False, autoflush=False, bind=health_engine)
-)
-HealthBase = declarative_base()
-HealthBase.query = health_session.query_property()
+health_session = Session
+HealthBase = Base
 
 
 class HealthMetric(HealthBase):
@@ -436,7 +422,7 @@ def init_health_db():
     """Initialize the health monitoring database"""
     from database.db_init_helper import init_db_with_logging
 
-    init_db_with_logging(HealthBase, health_engine, "Health Monitoring DB", logger)
+    init_db_with_logging(HealthBase, engine, "Health Monitoring DB", logger)
 
 
 def purge_old_metrics(days=7):

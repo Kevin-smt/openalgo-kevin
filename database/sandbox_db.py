@@ -17,9 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
-from utils.database_config import SANDBOX_POOL_CONFIG, create_engine_from_env
+from database.db import Base, Session, engine
 from utils.logging import get_logger
 from utils.timezone import now_ist
 
@@ -32,18 +30,8 @@ load_dotenv()
 # Sandbox database URL - separate database for isolation
 # Get from environment variable or use default path in /db directory
 SANDBOX_DATABASE_URL = os.getenv("SANDBOX_DATABASE_URL", "")
-engine = create_engine_from_env(
-    "SANDBOX_DATABASE_URL",
-    default_prefix="SANDBOX_DB",
-    fallback_url=os.getenv("DATABASE_URL"),
-    pool_config=SANDBOX_POOL_CONFIG,
-)
-
 logger.info(f"[LEDGER DEBUG] Sandbox DB engine URL: {engine.url}")
-
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+db_session = Session
 
 
 class SandboxOrders(Base):

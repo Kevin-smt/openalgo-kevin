@@ -26,25 +26,15 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
+
+from database.db import Base, Session, engine
 from database.db_init_helper import init_db_with_logging
-from utils.database_config import POOL_CONFIG, create_engine_from_env
 from utils.timezone import ensure_ist, ist_midnight, now_ist
 
 logger = logging.getLogger(__name__)
 
-engine = create_engine_from_env(
-    "DATABASE_URL",
-    default_prefix="DB",
-    pool_config=POOL_CONFIG,
-)
-
-TradingSession = scoped_session(
-    sessionmaker(autocommit=False, autoflush=False, bind=engine)
-)
-TradingBase = declarative_base()
-TradingBase.query = TradingSession.query_property()
+TradingSession = Session
+TradingBase = Base
 
 
 def _utcnow() -> datetime:

@@ -220,6 +220,22 @@ from websocket_proxy.app_integration import start_websocket_proxy
 logger = get_logger(__name__)
 
 
+def _setup_query_instrumentation(app):
+    from sqlalchemy import event
+    from database.db import engine as _db_engine
+    import time
+
+    @event.listens_for(_db_engine, "before_cursor_execute")
+    def before_cursor_execute(conn, cursor, statement, params, context, executemany):
+        conn.info.setdefault("query_start_time", []).append(time.time())
+
+    @event.listens_for(_db_engine, "after_cursor_execute")
+    def after_cursor_execute(conn, cursor, statement, params, context, executemany):
+        total = time.time() - conn.info["query_start_time"].pop(-1)
+        if total > 0.5:
+            logger.warning(f"SLOW QUERY ({total*1000:.0f}ms): {statement[:120]}")
+
+
 def create_app():
     # Initialize Flask application
     app = Flask(__name__)
@@ -260,6 +276,7 @@ def create_app():
     # Environment variables
     app.secret_key = os.getenv("APP_KEY")
     app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+    _setup_query_instrumentation(app)
 
     # Dynamic cookie security configuration based on HOST_SERVER
     HOST_SERVER = os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
@@ -401,19 +418,16 @@ def create_app():
 
     @app.before_request
     def wait_for_db_ready():
-        """Block requests until background database initialization completes."""
+        """Block non-API requests until background database initialization completes."""
         from flask import request
 
-        # Static assets don't need DB
-        if (
-            request.path.startswith("/static/")
-            or request.path.startswith("/assets/")
-        ):
+        if request.path.startswith("/api/"):
+            return
+        if request.path.startswith("/static/") or request.path.startswith("/assets/"):
             return
 
-        # Wait up to 30s for DB init (typically ~3.5s)
         if hasattr(app, "db_ready") and not app.db_ready.is_set():
-            app.db_ready.wait(timeout=30)
+            app.db_ready.wait(timeout=10)
 
     @app.before_request
     def check_session_expiry():
@@ -853,36 +867,13 @@ _start_pool_monitor_thread()
 # Database session cleanup (teardown handler)
 @app.teardown_appcontext
 def shutdown_database_sessions(exception=None):
-    """Remove scoped sessions after each request to prevent FD leaks"""
-    cleanup_targets = [
-        ("database.auth_db", "db_session", "auth db_session"),
-        ("database.user_db", "db_session", "user db_session"),
-        ("database.settings_db", "db_session", "settings db_session"),
-        ("database.flow_db", "db_session", "flow db_session"),
-        ("database.action_center_db", "db_session", "action_center db_session"),
-        ("database.leverage_db", "db_session", "leverage db_session"),
-        ("database.market_calendar_db", "db_session", "market_calendar db_session"),
-        ("database.qty_freeze_db", "db_session", "qty_freeze db_session"),
-        ("database.chart_prefs_db", "db_session", "chart_prefs db_session"),
-        ("database.strategy_db", "db_session", "strategy db_session"),
-        ("database.chartink_db", "db_session", "chartink db_session"),
-        ("database.analyzer_db", "db_session", "analyzer db_session"),
-        ("database.sandbox_db", "db_session", "sandbox db_session"),
-        ("database.trading_db", "TradingSession", "trading session"),
-        ("database.symbol", "db_session", "symbol db_session"),
-        ("database.traffic_db", "logs_session", "logs_session"),
-        ("database.apilog_db", "db_session", "apilog_session"),
-        ("database.latency_db", "latency_session", "latency_session"),
-        ("database.health_db", "health_session", "health_session"),
-        ("database.telegram_db", "db_session", "telegram db_session"),
-    ]
+    """Remove the shared scoped session after each request."""
+    try:
+        from database.db import Session
 
-    for module_name, attr_name, label in cleanup_targets:
-        try:
-            module = __import__(module_name, fromlist=[attr_name])
-            getattr(module, attr_name).remove()
-        except Exception as e:
-            logger.error(f"Error removing {label}: {e}")
+        Session.remove()
+    except Exception as e:
+        logger.error(f"Error removing database session: {e}")
 
 
 # Integrate the WebSocket proxy server with the Flask app

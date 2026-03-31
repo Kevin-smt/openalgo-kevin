@@ -19,12 +19,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.sql import func
 
-from utils.database_config import create_engine_from_env
+from database.db import Base, Session, engine
 from utils.logging import get_logger
+from utils.api_key_cache import clear_all as clear_api_key_cache
+from utils.api_key_cache import get_cached_api_key, set_cached_api_key
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -123,19 +123,13 @@ verified_api_key_cache = TTLCache(maxsize=1024, ttl=36000)  # 10 hours
 # Define a cache for invalid API keys with shorter 5-minute TTL (prevent cache poisoning)
 invalid_api_key_cache = TTLCache(maxsize=512, ttl=300)  # 5 minutes
 
-engine = create_engine_from_env(
-    "DATABASE_URL", default_prefix="DB", pool_size=50, max_overflow=100, pool_timeout=10
-)
-
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+db_session = Session
 
 
 class Auth(Base):
     __tablename__ = "auth"
     id = Column(Integer, primary_key=True)
-    name = Column(String(255), unique=True, nullable=False)
+    name = Column(String(255), unique=True, nullable=False, index=True)
     auth = Column(Text, nullable=False)
     feed_token = Column(
         Text, nullable=True
@@ -155,8 +149,8 @@ class Auth(Base):
 class ApiKeys(Base):
     __tablename__ = "api_keys"
     id = Column(Integer, primary_key=True)
-    user_id = Column(String, nullable=False, unique=True)
-    api_key_hash = Column(Text, nullable=False)  # For verification
+    user_id = Column(String, nullable=False, unique=True, index=True)
+    api_key_hash = Column(Text, nullable=False, index=True)  # For verification
     api_key_encrypted = Column(Text, nullable=False)  # For retrieval
     created_at = Column(DateTime(timezone=True), default=func.now())
     order_mode = Column(String(20), default="auto")  # 'auto' or 'semi_auto'
@@ -404,6 +398,7 @@ def invalidate_user_cache(user_id):
     feed_token_cache.clear()
     verified_api_key_cache.clear()
     invalid_api_key_cache.clear()
+    clear_api_key_cache()
     logger.info(f"Cleared all caches for user_id: {user_id}")
 
 
@@ -492,6 +487,10 @@ def verify_api_key(provided_api_key):
     # Security: Never store plaintext API key in cache
     cache_key = hashlib.sha256(provided_api_key.encode()).hexdigest()
 
+    cached = get_cached_api_key(cache_key)
+    if cached is not None:
+        return cached.get("user_id")
+
     # Step 1: Check invalid cache first (fast rejection of known bad keys)
     if cache_key in invalid_api_key_cache:
         logger.debug("API key rejected from invalid cache")
@@ -515,6 +514,7 @@ def verify_api_key(provided_api_key):
                 ph.verify(api_key_obj.api_key_hash, peppered_key)
                 # Valid key found - cache it
                 verified_api_key_cache[cache_key] = api_key_obj.user_id
+                set_cached_api_key(cache_key, {"user_id": api_key_obj.user_id})
                 logger.debug(f"API key verified and cached for user_id: {api_key_obj.user_id}")
                 return api_key_obj.user_id
             except VerifyMismatchError:

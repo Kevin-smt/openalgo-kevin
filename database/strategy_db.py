@@ -3,11 +3,10 @@ import os
 
 from cachetools import TTLCache
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Time
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, scoped_session, sessionmaker
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
-from utils.database_config import create_engine_from_env
+from database.db import Base, Session, engine
 
 logger = logging.getLogger(__name__)
 
@@ -18,13 +17,7 @@ _user_strategies_cache = TTLCache(maxsize=1000, ttl=600)  # 10 minutes TTL
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-engine = create_engine_from_env(
-    "DATABASE_URL", default_prefix="DB", pool_size=50, max_overflow=100, pool_timeout=10
-)
-
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+db_session = Session
 
 
 class Strategy(Base):

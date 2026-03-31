@@ -113,10 +113,10 @@ def check_db_connectivity():
 
     databases = {
         "openalgo": ("database.auth_db", "engine"),
-        "logs": ("database.traffic_db", "logs_engine"),
-        "latency": ("database.latency_db", "latency_engine"),
+        "logs": ("database.traffic_db", "engine"),
+        "latency": ("database.latency_db", "engine"),
         "sandbox": ("database.sandbox_db", "engine"),
-        "health": ("database.health_db", "health_engine"),
+        "health": ("database.health_db", "engine"),
     }
 
     for db_name, (module_name, engine_attr) in databases.items():

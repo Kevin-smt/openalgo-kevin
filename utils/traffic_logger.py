@@ -2,7 +2,8 @@ import time
 
 from flask import g, has_request_context, request
 
-from database.traffic_db import TrafficLog, logs_session
+from database.traffic_db import TrafficLog
+from utils.async_db_logger import async_log
 from utils.ip_helper import get_real_ip
 from utils.logging import get_logger
 
@@ -37,20 +38,21 @@ class TrafficLoggerMiddleware:
 
             try:
                 duration_ms = (time.time() - start_time) * 1000
-                TrafficLog.log_request(
-                    client_ip=get_real_ip(),
-                    method=request.method,
-                    path=request.path,
-                    status_code=status_code,
-                    duration_ms=duration_ms,
-                    host=request.host,
-                    error=error,
-                    user_id=getattr(g, "user_id", None),
+                async_log(
+                    TrafficLog,
+                    {
+                        "client_ip": get_real_ip(),
+                        "method": request.method,
+                        "path": request.path,
+                        "status_code": status_code,
+                        "duration_ms": duration_ms,
+                        "host": request.host,
+                        "error": error,
+                        "user_id": getattr(g, "user_id", None),
+                    },
                 )
             except Exception as e:
                 logger.exception(f"Error logging traffic: {e}")
-            finally:
-                logs_session.remove()
 
         # Store the original start_response to intercept the status code
         def custom_start_response(status, headers, exc_info=None):
