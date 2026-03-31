@@ -176,8 +176,9 @@ class BrokerSymbolCache:
         Load all symbols for the active broker into memory
         This is called once after master contract download
         """
+        db_session = None
         try:
-            from database.symbol import SymToken
+            from database.symbol import SymToken, db_session
 
             start_time = time.time()
             logger.debug(f"Loading all symbols for broker: {broker}")
@@ -185,64 +186,83 @@ class BrokerSymbolCache:
             # Clear existing cache
             self.clear_cache()
 
-            # Query all symbols from database
-            symbols = SymToken.query.all()
+            # Stream only the columns we need instead of materializing ORM objects.
+            symbol_rows = (
+                db_session.query(
+                    SymToken.symbol,
+                    SymToken.brsymbol,
+                    SymToken.name,
+                    SymToken.exchange,
+                    SymToken.brexchange,
+                    SymToken.token,
+                    SymToken.expiry,
+                    SymToken.strike,
+                    SymToken.lotsize,
+                    SymToken.instrumenttype,
+                    SymToken.tick_size,
+                )
+                .yield_per(5000)
+            )
 
-            if not symbols:
-                logger.warning(f"No symbols found in database for broker: {broker}")
-                return False
+            row_count = 0
+            for row in symbol_rows:
+                row_count += 1
+                if row_count % 25000 == 0:
+                    logger.info(f"Loaded {row_count} symbols into cache for broker: {broker}")
 
-            # Build in-memory structures
-            for sym in symbols:
                 # Extract underlying from OpenAlgo symbol format for FNO exchanges
                 underlying = None
-                if sym.exchange in FNO_EXCHANGES:
-                    underlying = extract_underlying_from_symbol(sym.symbol, sym.exchange)
+                if row.exchange in FNO_EXCHANGES:
+                    underlying = extract_underlying_from_symbol(row.symbol, row.exchange)
 
                 # Create lightweight data object
                 symbol_data = SymbolData(
-                    symbol=sym.symbol,
-                    brsymbol=sym.brsymbol,
-                    name=sym.name,
-                    exchange=sym.exchange,
-                    brexchange=sym.brexchange,
-                    token=sym.token,
-                    expiry=sym.expiry,
-                    strike=sym.strike,
-                    lotsize=sym.lotsize,
-                    instrumenttype=sym.instrumenttype,
-                    tick_size=sym.tick_size,
+                    symbol=row.symbol,
+                    brsymbol=row.brsymbol,
+                    name=row.name,
+                    exchange=row.exchange,
+                    brexchange=row.brexchange,
+                    token=row.token,
+                    expiry=row.expiry,
+                    strike=row.strike,
+                    lotsize=row.lotsize,
+                    instrumenttype=row.instrumenttype,
+                    tick_size=row.tick_size,
                     underlying=underlying,
-                    contract_value=getattr(sym, 'contract_value', None),
+                    contract_value=None,
                 )
 
                 # Store in primary dict
-                self.symbols[sym.token] = symbol_data
+                self.symbols[row.token] = symbol_data
 
                 # Build indexes
-                self.by_symbol_exchange[(sym.symbol, sym.exchange)] = symbol_data
-                self.by_token_exchange[(sym.token, sym.exchange)] = symbol_data
-                self.by_brsymbol_exchange[(sym.brsymbol, sym.exchange)] = symbol_data
-                self.by_token[sym.token] = symbol_data
+                self.by_symbol_exchange[(row.symbol, row.exchange)] = symbol_data
+                self.by_token_exchange[(row.token, row.exchange)] = symbol_data
+                self.by_brsymbol_exchange[(row.brsymbol, row.exchange)] = symbol_data
+                self.by_token[row.token] = symbol_data
 
                 # Build FNO filter indexes for O(1) lookups
-                self.by_exchange[sym.exchange].append(symbol_data)
-                if sym.expiry:
-                    self.expiries_by_exchange[sym.exchange].add(sym.expiry)
+                self.by_exchange[row.exchange].append(symbol_data)
+                if row.expiry:
+                    self.expiries_by_exchange[row.exchange].add(row.expiry)
                     # Use extracted underlying for index (more reliable than broker's name field)
                     if underlying:
-                        self.expiries_by_exchange_underlying[(sym.exchange, underlying)].add(sym.expiry)
+                        self.expiries_by_exchange_underlying[(row.exchange, underlying)].add(row.expiry)
                 # Use extracted underlying for underlyings index.
                 # Only track underlyings that have options (CE/PE) — perpetuals, futures,
                 # spreads, etc. should not appear in the option-chain/IV-chart dropdown.
-                sym_upper = sym.symbol.upper()
+                sym_upper = row.symbol.upper()
                 if underlying and (sym_upper.endswith("CE") or sym_upper.endswith("PE")):
-                    self.underlyings_by_exchange[sym.exchange].add(underlying)
+                    self.underlyings_by_exchange[row.exchange].add(underlying)
+
+            if row_count == 0:
+                logger.warning(f"No symbols found in database for broker: {broker}")
+                return False
 
             # Update cache metadata
             self.active_broker = broker
             self.cache_loaded = True
-            self.stats.total_symbols = len(symbols)
+            self.stats.total_symbols = row_count
             self.stats.cache_loads += 1
             self.stats.last_loaded = datetime.now(pytz.timezone("Asia/Kolkata"))
 
@@ -266,6 +286,12 @@ class BrokerSymbolCache:
         except Exception as e:
             logger.exception(f"Error loading symbols into cache: {e}")
             return False
+        finally:
+            if db_session is not None:
+                try:
+                    db_session.remove()
+                except Exception:
+                    pass
 
     def _set_session_timing(self):
         """Set session start and next reset time from SESSION_EXPIRY_TIME env variable"""

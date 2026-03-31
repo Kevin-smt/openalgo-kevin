@@ -3,6 +3,7 @@ import os
 import random
 import socket
 import threading
+import time
 from abc import ABC, abstractmethod
 
 import zmq
@@ -185,8 +186,10 @@ class BaseBrokerWebSocketAdapter(ABC):
         """
         with self._context_lock:
             socket = self.context.socket(zmq.PUB)
-            socket.setsockopt(zmq.LINGER, 1000)  # 1 second linger
-            socket.setsockopt(zmq.SNDHWM, 1000)  # High water mark
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.IMMEDIATE, 1)
+            socket.setsockopt(zmq.SNDHWM, int(os.getenv("ZMQ_SNDHWM", "1000")))
+            socket.setsockopt(zmq.SNDTIMEO, 0)
             return socket
 
     def _bind_to_available_port(self):
@@ -414,10 +417,24 @@ class BaseBrokerWebSocketAdapter(ABC):
             elif self.socket:
                 # Use own socket
                 self.socket.send_multipart(
-                    [topic.encode("utf-8"), json.dumps(data).encode("utf-8")]
+                    [topic.encode("utf-8"), json.dumps(data, separators=(",", ":")).encode("utf-8")],
+                    flags=zmq.NOBLOCK,
                 )
             else:
                 self.logger.warning("No ZMQ socket available for publishing")
+        except zmq.Again:
+            if not hasattr(self, "_zmq_drop_count"):
+                self._zmq_drop_count = 0
+                self._zmq_last_drop_log = 0.0
+            self._zmq_drop_count += 1
+            now = time.monotonic()
+            if now - self._zmq_last_drop_log > 5:
+                self._zmq_last_drop_log = now
+                self.logger.warning(
+                    "Dropping market data due to ZMQ backpressure (dropped=%s, topic=%s)",
+                    self._zmq_drop_count,
+                    topic,
+                )
         except Exception as e:
             self.logger.exception(f"Error publishing market data: {e}")
 

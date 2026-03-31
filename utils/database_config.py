@@ -52,6 +52,24 @@ _ENGINE_CACHE: dict[tuple[str, tuple[tuple[str, object], ...]], object] = {}
 _ENGINE_CACHE_LOCK = threading.Lock()
 
 
+def _cap_pool_config(pool_config: dict[str, object]) -> dict[str, object]:
+    """Cap aggressive pool settings in production to avoid exhausting remote DBs."""
+    capped = dict(pool_config)
+
+    if get_runtime_environment() == "production":
+        pool_size_cap = int(os.getenv("DB_POOL_SIZE_CAP", "10"))
+        overflow_cap = int(os.getenv("DB_MAX_OVERFLOW_CAP", "5"))
+        timeout_floor = int(os.getenv("DB_POOL_TIMEOUT_FLOOR", "5"))
+
+        capped["pool_size"] = min(int(capped.get("pool_size", POOL_CONFIG["pool_size"])), pool_size_cap)
+        capped["max_overflow"] = min(
+            int(capped.get("max_overflow", POOL_CONFIG["max_overflow"])), overflow_cap
+        )
+        capped["pool_timeout"] = max(int(capped.get("pool_timeout", POOL_CONFIG["pool_timeout"])), timeout_floor)
+
+    return capped
+
+
 def get_runtime_environment() -> str:
     """Return the active environment name used for DB profile selection."""
     env = (os.getenv("ENV") or os.getenv("FLASK_ENV") or DEFAULT_ENV_VALUE).strip().lower()
@@ -210,6 +228,8 @@ def create_engine_from_env(
         else:
             effective_pool_config = POOL_CONFIG
 
+    effective_pool_config = _cap_pool_config(dict(effective_pool_config))
+
     return get_engine(database_url, echo=echo, pool_config=effective_pool_config)
 
 
@@ -226,6 +246,8 @@ def get_engine(
     effective_pool_config = dict(POOL_CONFIG)
     if pool_config:
         effective_pool_config.update(pool_config)
+
+    effective_pool_config = _cap_pool_config(effective_pool_config)
 
     cache_key = (database_url, tuple(sorted(effective_pool_config.items())))
 
@@ -467,7 +489,7 @@ def bulk_insert_mappings_chunked(
     model,
     records,
     *,
-    chunk_size: int = 500,
+    chunk_size: int = 1000,
     logger: logging.Logger | None = None,
     label: str = "bulk insert",
     progress_every: int = 10,
@@ -481,23 +503,32 @@ def bulk_insert_mappings_chunked(
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     total = len(records)
     inserted = 0
+    effective_chunk_size = chunk_size
+    if label.lower().startswith("master contract"):
+        env_chunk_size = os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE")
+        if env_chunk_size:
+            effective_chunk_size = max(1, int(env_chunk_size))
+        else:
+            effective_chunk_size = max(chunk_size, int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE_DEFAULT", "15000")))
 
     if logger:
-        logger.info(f"Starting {label} of {total} records in chunks of {chunk_size}")
+        logger.info(f"Starting {label} of {total} records in chunks of {effective_chunk_size}")
 
-    for start in range(0, total, chunk_size):
-        chunk = records[start : start + chunk_size]
+    for start in range(0, total, effective_chunk_size):
+        chunk = records[start : start + effective_chunk_size]
         session = session_factory()
         try:
             session.bulk_insert_mappings(model, chunk)
             session.commit()
             inserted += len(chunk)
-            if logger and ((start // chunk_size + 1) % progress_every == 0 or inserted == total):
+            if logger and ((start // effective_chunk_size + 1) % progress_every == 0 or inserted == total):
                 logger.info(f"Inserted {inserted}/{total} records")
         except Exception as exc:
             session.rollback()
             if logger:
-                logger.exception(f"{label} chunk insert failed at chunk {start // chunk_size + 1}: {exc}")
+                logger.exception(
+                    f"{label} chunk insert failed at chunk {start // effective_chunk_size + 1}: {exc}"
+                )
             raise
         finally:
             session.close()

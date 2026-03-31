@@ -6,6 +6,7 @@ import pytz
 from flask import redirect, session, url_for
 
 from utils.logging import get_logger
+from utils.timezone import ensure_ist
 
 logger = get_logger(__name__)
 
@@ -74,7 +75,7 @@ def is_session_valid():
     now_ist = now_utc.astimezone(pytz.timezone("Asia/Kolkata"))
 
     # Parse login time
-    login_time = datetime.fromisoformat(session["login_time"])
+    login_time = ensure_ist(datetime.fromisoformat(session["login_time"]))
 
     # Get configured expiry time
     expiry_time = os.getenv("SESSION_EXPIRY_TIME", "03:00")

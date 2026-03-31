@@ -8,6 +8,7 @@ import time
 
 from extensions import socketio
 from utils.logging import get_logger
+from utils.database_config import get_runtime_environment
 
 logger = get_logger(__name__)
 
@@ -24,7 +25,7 @@ def should_load_symbol_cache() -> bool:
     if flag is not None:
         return flag.lower() in ("1", "true", "yes", "on")
 
-    return os.getenv("FLASK_ENV", "").lower() != "production"
+    return get_runtime_environment() != "production"
 
 
 def load_symbols_to_cache(broker: str) -> bool:

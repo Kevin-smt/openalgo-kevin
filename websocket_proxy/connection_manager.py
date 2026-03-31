@@ -13,6 +13,7 @@ Configuration:
 import json
 import os
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional, Tuple
@@ -81,11 +82,15 @@ class SharedZmqPublisher:
         self.logger = get_logger("shared_zmq_publisher")
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        self.socket.setsockopt(zmq.LINGER, 1000)
-        self.socket.setsockopt(zmq.SNDHWM, 1000)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.IMMEDIATE, 1)
+        self.socket.setsockopt(zmq.SNDHWM, int(os.getenv("ZMQ_SNDHWM", "1000")))
+        self.socket.setsockopt(zmq.SNDTIMEO, 0)
         self.zmq_port = None
         self._bound = False
         self._publish_lock = threading.Lock()
+        self._drop_count = 0
+        self._last_drop_log = 0.0
 
     def bind(self, port: int | None = None) -> int:
         """
@@ -147,8 +152,19 @@ class SharedZmqPublisher:
         with self._publish_lock:
             try:
                 self.socket.send_multipart(
-                    [topic.encode("utf-8"), json.dumps(data).encode("utf-8")]
+                    [topic.encode("utf-8"), json.dumps(data, separators=(",", ":")).encode("utf-8")],
+                    flags=zmq.NOBLOCK,
                 )
+            except zmq.Again:
+                self._drop_count += 1
+                now = time.monotonic()
+                if now - self._last_drop_log > 5:
+                    self._last_drop_log = now
+                    self.logger.warning(
+                        "Dropping shared ZMQ market data due to backpressure (dropped=%s, topic=%s)",
+                        self._drop_count,
+                        topic,
+                    )
             except Exception as e:
                 self.logger.exception(f"Error publishing to ZMQ: {e}")
 

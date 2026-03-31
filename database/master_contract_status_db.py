@@ -11,8 +11,8 @@ from utils.database_config import create_engine_from_env
 from utils.timezone import ensure_ist, now_ist
 
 
-def _now_ist_naive():
-    return now_ist().replace(tzinfo=None)
+def _now_ist_aware():
+    return now_ist()
 logger = logging.getLogger(__name__)
 
 # If a download stays in 'downloading' state longer than this, treat it as stuck/failed
@@ -39,12 +39,12 @@ class MasterContractStatus(Base):
     broker = Column(String, primary_key=True)
     status = Column(String, default="pending")  # pending, downloading, success, error
     message = Column(String)
-    last_updated = Column(DateTime, default=_now_ist_naive)
+    last_updated = Column(DateTime(timezone=True), default=_now_ist_aware)
     total_symbols = Column(String, default="0")
     is_ready = Column(Boolean, default=False)
 
     # Smart download tracking columns
-    last_download_time = Column(DateTime, nullable=True)  # When download completed successfully
+    last_download_time = Column(DateTime(timezone=True), nullable=True)  # When download completed successfully
     download_date = Column(Date, nullable=True)           # Trading day of the download
     exchange_stats = Column(Text, nullable=True)          # JSON: {"NSE": 2500, "NFO": 85000, ...}
     download_duration_seconds = Column(Integer, nullable=True)  # How long download took
@@ -65,7 +65,7 @@ def init_broker_status(broker):
             # Update existing status
             existing.status = "pending"
             existing.message = "Master contract download pending"
-            existing.last_updated = _now_ist_naive()
+            existing.last_updated = _now_ist_aware()
             existing.is_ready = False
         else:
             # Create new status
@@ -73,7 +73,7 @@ def init_broker_status(broker):
                 broker=broker,
                 status="pending",
                 message="Master contract download pending",
-                last_updated=_now_ist_naive(),
+                last_updated=_now_ist_aware(),
                 is_ready=False,
             )
             session.add(status)
@@ -97,7 +97,7 @@ def update_status(broker, status, message, total_symbols=None):
         if broker_status:
             broker_status.status = status
             broker_status.message = message
-            broker_status.last_updated = _now_ist_naive()
+            broker_status.last_updated = _now_ist_aware()
             broker_status.is_ready = status == "success"
 
             if total_symbols is not None:
@@ -108,7 +108,7 @@ def update_status(broker, status, message, total_symbols=None):
                 broker=broker,
                 status=status,
                 message=message,
-                last_updated=_now_ist_naive(),
+                last_updated=_now_ist_aware(),
                 is_ready=(status == "success"),
                 total_symbols=str(total_symbols) if total_symbols else "0",
             )
@@ -136,7 +136,7 @@ def get_status(broker):
             if (
                 status.status == "downloading"
                 and status.last_updated
-                and _now_ist_naive() - ensure_ist(status.last_updated).replace(tzinfo=None) > timedelta(minutes=DOWNLOAD_TIMEOUT_MINUTES)
+                and now_ist() - ensure_ist(status.last_updated) > timedelta(minutes=DOWNLOAD_TIMEOUT_MINUTES)
             ):
                 logger.warning(
                     f"Download for {broker} stuck for >{DOWNLOAD_TIMEOUT_MINUTES}min, marking as error"
@@ -146,7 +146,7 @@ def get_status(broker):
                     f"Download timed out (stuck for >{DOWNLOAD_TIMEOUT_MINUTES} minutes). "
                     "Click Force Download to retry."
                 )
-                status.last_updated = _now_ist_naive()
+                status.last_updated = _now_ist_aware()
                 status.is_ready = False
                 session.commit()
 
@@ -234,7 +234,7 @@ def update_download_stats(broker, duration_seconds, exchange_stats=None):
     try:
         status = session.query(MasterContractStatus).filter_by(broker=broker).first()
         if status:
-            status.last_download_time = _now_ist_naive()
+            status.last_download_time = _now_ist_aware()
             status.download_date = now_ist().date()
             status.download_duration_seconds = duration_seconds
             if exchange_stats:
@@ -257,7 +257,7 @@ def mark_status_ready_without_download(broker):
             status.is_ready = True
             status.status = "success"
             status.message = "Using cached master contract"
-            status.last_updated = _now_ist_naive()
+            status.last_updated = _now_ist_aware()
             session.commit()
             logger.info(f"Marked existing master contract as ready for {broker}")
             return True

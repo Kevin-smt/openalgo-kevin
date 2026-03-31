@@ -7,6 +7,10 @@ import os
 import re
 import sys
 
+# Master-contract inserts should use larger batches by default to reduce round trips.
+# Individual deployments can still override this via an environment variable.
+os.environ.setdefault("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "1500")
+
 # Print startup banner EARLY (before heavy imports) so user sees immediate feedback
 if __name__ == "__main__":
     from utils.version import get_version as _get_version_early

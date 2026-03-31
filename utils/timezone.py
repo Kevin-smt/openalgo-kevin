@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import date, datetime
+from typing import Literal
 
 try:
     from zoneinfo import ZoneInfo
@@ -45,6 +46,55 @@ def ensure_ist(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=IST)
     return value.astimezone(IST)
+
+
+def normalize_datetime(
+    value: datetime | None,
+    *,
+    tz: object = IST,
+    strategy: Literal["aware", "naive"] = "aware",
+) -> datetime | None:
+    """
+    Normalize a datetime for safe comparison.
+
+    Args:
+        value: Input datetime.
+        tz: Target timezone for aware normalization.
+        strategy: "aware" returns a timezone-aware datetime in `tz`;
+                  "naive" strips tzinfo after conversion to `tz`.
+    """
+    if value is None:
+        return None
+
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=IST)
+    normalized = normalized.astimezone(tz)
+    if strategy == "naive":
+        return normalized.replace(tzinfo=None)
+    return normalized
+
+
+def normalize_ist(value: datetime | None, *, strategy: Literal["aware", "naive"] = "aware") -> datetime | None:
+    """Normalize a datetime to IST using the shared app timezone."""
+    return normalize_datetime(value, tz=IST, strategy=strategy)
+
+
+def compare_aware_datetimes(left: datetime | None, right: datetime | None) -> int | None:
+    """
+    Compare two datetimes after normalizing both to aware IST values.
+
+    Returns:
+        1 if left > right, 0 if equal, -1 if left < right, None if either value is None.
+    """
+    if left is None or right is None:
+        return None
+
+    left_norm = normalize_ist(left)
+    right_norm = normalize_ist(right)
+    if left_norm > right_norm:
+        return 1
+    if left_norm < right_norm:
+        return -1
+    return 0
 
 
 def utc_to_ist(value: datetime | None) -> datetime | None:
