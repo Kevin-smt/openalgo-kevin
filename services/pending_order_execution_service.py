@@ -1,14 +1,63 @@
 # services/pending_order_execution_service.py
 
 import json
+import time
 from typing import Any, Dict, Tuple
 
 from database.action_center_db import get_pending_order_by_id, update_broker_status
 from database.auth_db import get_api_key_for_tradingview, get_auth_token
+from extensions import socketio
 from utils.logging import get_logger
 
 # Initialize logger
 logger = get_logger(__name__)
+
+
+def _log_timing(label: str, started_at: float, **fields: Any) -> None:
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    extras = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    if extras:
+        logger.info(f"[TIMING] pending_order_execution | stage={label} | elapsed_ms={elapsed_ms} | {extras}")
+    else:
+        logger.info(f"[TIMING] pending_order_execution | stage={label} | elapsed_ms={elapsed_ms}")
+
+
+def _refresh_pending_order_status(
+    pending_order_id: int,
+    broker_order_id: str,
+    api_key: str,
+    auth_token: str,
+    broker: str,
+    user_id: str,
+) -> None:
+    """Best-effort background reconciliation for approved orders."""
+    try:
+        from services.orderstatus_service import get_order_status
+
+        status_success, status_response, _ = get_order_status(
+            status_data={"orderid": broker_order_id},
+            api_key=api_key,
+            auth_token=auth_token,
+            broker=broker,
+            user_id=user_id,
+        )
+
+        if status_success and isinstance(status_response, dict) and "data" in status_response:
+            actual_status = status_response["data"].get("status", "open")
+            update_broker_status(pending_order_id, broker_order_id, actual_status)
+            logger.info(
+                f"Order status refreshed in background: pending_order_id={pending_order_id}, "
+                f"broker_order_id={broker_order_id}, status={actual_status}"
+            )
+        else:
+            update_broker_status(pending_order_id, broker_order_id, "open")
+            logger.info(
+                f"Order status refresh did not return data; kept open: pending_order_id={pending_order_id}, "
+                f"broker_order_id={broker_order_id}"
+            )
+    except Exception as exc:
+        logger.exception(f"Background order status refresh failed: {exc}")
+        update_broker_status(pending_order_id, broker_order_id, "open")
 
 
 def execute_approved_order(pending_order_id: int) -> tuple[bool, dict[str, Any], int]:
@@ -25,8 +74,10 @@ def execute_approved_order(pending_order_id: int) -> tuple[bool, dict[str, Any],
         - HTTP status code (int)
     """
     try:
+        started_at = time.perf_counter()
         # Get the pending order
         pending_order = get_pending_order_by_id(pending_order_id)
+        _log_timing("pending_order_loaded", started_at, pending_order_id=pending_order_id)
 
         if not pending_order:
             logger.error(f"Pending order {pending_order_id} not found")
@@ -52,15 +103,18 @@ def execute_approved_order(pending_order_id: int) -> tuple[bool, dict[str, Any],
 
         # Get the user's API key (needed for order_data validation and broker functions)
         api_key = get_api_key_for_tradingview(user_id)
+        _log_timing("api_key_loaded", started_at, user_id=user_id)
 
         # Get auth token and broker (to skip routing check and authenticate)
         auth_token = get_auth_token(user_id)
+        _log_timing("auth_token_loaded", started_at, user_id=user_id)
 
         # Get broker from auth table
         from database.auth_db import Auth
 
         auth_obj = Auth.query.filter_by(name=user_id).first()
         broker = auth_obj.broker if auth_obj else None
+        _log_timing("broker_loaded", started_at, user_id=user_id, broker=broker)
 
         if not api_key or not auth_token or not broker:
             logger.error(
@@ -89,8 +143,16 @@ def execute_approved_order(pending_order_id: int) -> tuple[bool, dict[str, Any],
             if api_type == "placeorder":
                 from services.place_order_service import place_order
 
+                place_started_at = time.perf_counter()
                 success, response_data, status_code = place_order(
                     order_data=order_data, api_key=api_key, auth_token=auth_token, broker=broker
+                )
+                _log_timing(
+                    "place_order_complete",
+                    place_started_at,
+                    pending_order_id=pending_order_id,
+                    success=success,
+                    status_code=status_code,
                 )
 
             elif api_type == "smartorder":
@@ -142,42 +204,46 @@ def execute_approved_order(pending_order_id: int) -> tuple[bool, dict[str, Any],
             if success and "orderid" in response_data:
                 broker_order_id = response_data["orderid"]
 
-                # Get actual order status from broker
-                try:
-                    from services.orderstatus_service import get_order_status
+                # Persist the execution immediately, then reconcile the final broker
+                # status in the background to keep the approval response fast.
+                update_broker_status(pending_order_id, broker_order_id, "open")
+                _log_timing(
+                    "pending_order_status_updated",
+                    started_at,
+                    pending_order_id=pending_order_id,
+                    broker_order_id=broker_order_id,
+                )
+                logger.info(
+                    f"Order executed successfully: pending_order_id={pending_order_id}, "
+                    f"broker_order_id={broker_order_id}"
+                )
 
-                    status_success, status_response, _ = get_order_status(
-                        status_data={"orderid": broker_order_id},
-                        api_key=api_key,
-                        auth_token=auth_token,
-                        broker=broker,
-                    )
-
-                    # Extract broker status from response
-                    if status_success and "data" in status_response:
-                        actual_status = status_response["data"].get("status", "open")
-                        update_broker_status(pending_order_id, broker_order_id, actual_status)
-                        logger.info(
-                            f"Order executed: pending_order_id={pending_order_id}, broker_order_id={broker_order_id}, status={actual_status}"
-                        )
-                    else:
-                        # Fallback to 'open' if status check fails
-                        update_broker_status(pending_order_id, broker_order_id, "open")
-                        logger.info(
-                            f"Order executed successfully: pending_order_id={pending_order_id}, broker_order_id={broker_order_id}"
-                        )
-                except Exception as e:
-                    logger.exception(f"Error checking order status: {e}")
-                    # Fallback to 'open' on error
-                    update_broker_status(pending_order_id, broker_order_id, "open")
-                    logger.info(
-                        f"Order executed successfully: pending_order_id={pending_order_id}, broker_order_id={broker_order_id}"
-                    )
+                socketio.start_background_task(
+                    _refresh_pending_order_status,
+                    pending_order_id,
+                    broker_order_id,
+                    api_key,
+                    auth_token,
+                    broker,
+                    user_id,
+                )
+                _log_timing(
+                    "background_status_refresh_queued",
+                    started_at,
+                    pending_order_id=pending_order_id,
+                    broker_order_id=broker_order_id,
+                )
 
             elif not success:
                 # Broker rejected the order
                 update_broker_status(pending_order_id, None, "rejected")
                 logger.warning(f"Order rejected by broker: pending_order_id={pending_order_id}")
+                _log_timing(
+                    "broker_rejected",
+                    started_at,
+                    pending_order_id=pending_order_id,
+                    status_code=status_code,
+                )
 
             return success, response_data, status_code
 

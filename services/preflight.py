@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 
 from argon2.exceptions import VerifyMismatchError
 from sqlalchemy import text
@@ -18,6 +19,7 @@ def get_trade_preflight(api_key: str, session) -> dict | None:
     if not api_key:
         return None
 
+    started_at = time.perf_counter()
     api_key_sha256 = hashlib.sha256(api_key.encode()).hexdigest()
 
     query = text(
@@ -46,6 +48,10 @@ def get_trade_preflight(api_key: str, session) -> dict | None:
 
     row = session.execute(query, {"api_key_sha256": api_key_sha256}).mappings().first()
     if not row:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        from utils.logging import get_logger
+
+        get_logger(__name__).info(f"[TIMING] preflight lookup failed | elapsed_ms={elapsed_ms}")
         return None
 
     if not bool(row["is_active"]):
@@ -58,7 +64,22 @@ def get_trade_preflight(api_key: str, session) -> dict | None:
 
     access_token = decrypt_token(row["encrypted_access_token"])
     if not access_token:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        from utils.logging import get_logger
+
+        get_logger(__name__).info(f"[TIMING] preflight decrypt failed | elapsed_ms={elapsed_ms}")
         return None
+
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    from utils.logging import get_logger
+
+    get_logger(__name__).info(
+        "[TIMING] preflight lookup complete | elapsed_ms=%s | user_id=%s | broker=%s | order_mode=%s",
+        elapsed_ms,
+        row["user_id"],
+        row["broker"],
+        row["action_center_mode"],
+    )
 
     return {
         "user_id": row["user_id"],

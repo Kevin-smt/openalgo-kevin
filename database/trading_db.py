@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -35,6 +36,15 @@ logger = logging.getLogger(__name__)
 
 TradingSession = Session
 TradingBase = Base
+
+
+def _log_timing(label: str, started_at: float, **fields: Any) -> None:
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    extras = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    if extras:
+        logger.info(f"[TIMING] trading_db | stage={label} | elapsed_ms={elapsed_ms} | {extras}")
+    else:
+        logger.info(f"[TIMING] trading_db | stage={label} | elapsed_ms={elapsed_ms}")
 
 
 def _utcnow() -> datetime:
@@ -168,6 +178,7 @@ def mirror_live_order(
 ) -> bool:
     """Best-effort live order mirror write that never affects request flow."""
     try:
+        started_at = time.perf_counter()
         ledger_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
         logger.info(
             "[LEDGER DEBUG] mirror_live_order called: user=%s broker=%s symbol=%s api_source=%s",
@@ -222,12 +233,20 @@ def mirror_live_order(
                 order_data.get("quantity"),
                 order_data.get("price"),
                 broker_response or {},
+                broker_order_id=resolved_broker_order_id,
             )
             logger.info(
                 "[LEDGER DEBUG] mirror_live_order completed successfully: local_order_id=%s, broker_order_id=%s",
                 local_order_id,
                 resolved_broker_order_id,
             )
+            # _log_timing(
+            #     "mirror_live_order_complete",
+            #     started_at,
+            #     broker=broker,
+            #     symbol=order_data.get("symbol"),
+            #     local_order_id=local_order_id,
+            # )
             return True
         logger.warning(
             "Live order mirror did not persist an order row "
@@ -474,6 +493,7 @@ def save_order(order_data: dict[str, Any]) -> int | None:
     if not order_data:
         return None
     try:
+        started_at = time.perf_counter()
         resolved_user_id = _resolve_ledger_user_id(
             user_id=order_data.get("user_id"),
             api_key=order_data.get("api_key"),
@@ -518,6 +538,13 @@ def save_order(order_data: dict[str, Any]) -> int | None:
                         broker_order_id,
                         payload["order_status"],
                     )
+                # _log_timing(
+                #     "save_order_upsert",
+                #     started_at,
+                #     broker=payload["broker"],
+                #     symbol=payload["symbol"],
+                #     broker_order_id=broker_order_id,
+                # )
                 return int(row_id) if row_id is not None else None
 
             order = Order(**payload)
@@ -532,6 +559,13 @@ def save_order(order_data: dict[str, Any]) -> int | None:
                 broker_order_id,
                 payload["order_status"],
             )
+            # _log_timing(
+            #     "save_order_insert",
+            #     started_at,
+            #     broker=payload["broker"],
+            #     symbol=payload["symbol"],
+            #     broker_order_id=broker_order_id,
+            # )
             return int(order.id)
     except Exception as exc:
         logger.exception("Error saving order")
@@ -552,6 +586,7 @@ def update_order_status(
         return False
 
     try:
+        started_at = time.perf_counter()
         filters = [Order.broker_order_id == str(broker_order_id)]
         if broker:
             filters.append(Order.broker == broker)
@@ -579,6 +614,14 @@ def update_order_status(
                     f"for broker_order_id={broker_order_id}"
                 )
                 return False
+            # _log_timing(
+            #     "update_order_status",
+            #     started_at,
+            #     broker_order_id=broker_order_id,
+            #     broker=broker,
+            #     user_id=user_id,
+            #     status=status,
+            # )
             return True
     except Exception as exc:
         logger.exception(f"Error updating order status for {broker_order_id}")
@@ -652,17 +695,18 @@ def save_order_event(
     qty: int | None,
     price: Any,
     broker_response: Any | None,
+    broker_order_id: str | None = None,
 ) -> int | None:
     """Insert a new order event row."""
     if not order_id:
         return None
 
     try:
+        started_at = time.perf_counter()
         with _trading_session_scope() as session:
-            order = session.query(Order).filter(Order.id == int(order_id)).first()
             event = OrderEvent(
                 order_id=int(order_id),
-                broker_order_id=order.broker_order_id if order else None,
+                broker_order_id=broker_order_id,
                 event_type=event_type,
                 quantity=_safe_int(qty, 0) if qty is not None else None,
                 price=_safe_decimal(price),
@@ -675,9 +719,16 @@ def save_order_event(
                 "[LEDGER DEBUG] order_event persisted: id=%s order_id=%s broker_order_id=%s event_type=%s",
                 event.id,
                 order_id,
-                event.broker_order_id,
+                broker_order_id,
                 event.event_type,
             )
+            # _log_timing(
+            #     "save_order_event",
+            #     started_at,
+            #     order_id=order_id,
+            #     broker_order_id=broker_order_id,
+            #     event_type=event_type,
+            # )
             return int(event.id)
     except Exception as exc:
         logger.exception(f"Error saving order event for order_id={order_id}")
@@ -740,6 +791,7 @@ def save_trade(trade_data: dict[str, Any]) -> int | None:
         return None
 
     try:
+        started_at = time.perf_counter()
         payload = _trade_payload(trade_data, user_id, broker)
         with _trading_session_scope() as session:
             broker_trade_id = payload.get("broker_trade_id")
@@ -766,6 +818,13 @@ def save_trade(trade_data: dict[str, Any]) -> int | None:
                         broker_trade_id,
                         payload.get("order_id"),
                     )
+                # _log_timing(
+                #     "save_trade_upsert",
+                #     started_at,
+                #     broker=payload["broker"],
+                #     symbol=payload["symbol"],
+                #     broker_trade_id=broker_trade_id,
+                # )
                 return int(row_id) if row_id is not None else None
 
             trade = Trade(**payload)
@@ -780,6 +839,13 @@ def save_trade(trade_data: dict[str, Any]) -> int | None:
                 broker_trade_id,
                 payload.get("order_id"),
             )
+            # _log_timing(
+            #     "save_trade_insert",
+            #     started_at,
+            #     broker=payload["broker"],
+            #     symbol=payload["symbol"],
+            #     broker_trade_id=broker_trade_id,
+            # )
             return int(trade.id)
     except Exception as exc:
         logger.exception(f"Error saving trade for user={user_id}, broker={broker}")
@@ -850,6 +916,7 @@ def upsert_positions(
 ) -> bool:
     """Full replace of mirrored positions for a user/broker."""
     try:
+        started_at = time.perf_counter()
         resolved_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
         if not resolved_user_id:
             logger.warning(
@@ -878,6 +945,13 @@ def upsert_positions(
                 deleted,
                 len(rows) if positions_list else 0,
             )
+            # _log_timing(
+            #     "upsert_positions",
+            #     started_at,
+            #     user_id=resolved_user_id,
+            #     broker=broker,
+            #     inserted=len(rows) if positions_list else 0,
+            # )
         return True
     except Exception as exc:
         logger.exception(f"Error upserting positions for user={user_id}, broker={broker}")
@@ -923,6 +997,7 @@ def upsert_holdings(
 ) -> bool:
     """Full replace of mirrored holdings for a user/broker."""
     try:
+        started_at = time.perf_counter()
         resolved_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
         if not resolved_user_id:
             logger.warning(
@@ -951,6 +1026,13 @@ def upsert_holdings(
                 deleted,
                 len(rows) if holdings_list else 0,
             )
+            # _log_timing(
+            #     "upsert_holdings",
+            #     started_at,
+            #     user_id=resolved_user_id,
+            #     broker=broker,
+            #     inserted=len(rows) if holdings_list else 0,
+            # )
         return True
     except Exception as exc:
         logger.exception(f"Error upserting holdings for user={user_id}, broker={broker}")

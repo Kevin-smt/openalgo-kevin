@@ -987,11 +987,23 @@ if is_docker:
         "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
     )
 else:
-    logger.debug("Running in local/integrated mode - Starting WebSocket proxy in Flask")
-    try:
-        start_websocket_proxy(app)
-    except Exception as e:
-        logger.exception(f"WebSocket proxy failed to start; continuing without it: {e}")
+    enable_websocket_proxy = os.getenv("ENABLE_WEBSOCKET_PROXY", "false").lower() in (
+        "1",
+        "true",
+        "t",
+        "yes",
+    )
+
+    if enable_websocket_proxy:
+        logger.debug("Running in local/integrated mode - Starting WebSocket proxy in Flask")
+        try:
+            start_websocket_proxy(app)
+        except Exception as e:
+            logger.exception(f"WebSocket proxy failed to start; continuing without it: {e}")
+    else:
+        logger.info(
+            "Running in local/integrated mode - WebSocket proxy is disabled by ENABLE_WEBSOCKET_PROXY"
+        )
 
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == "__main__":

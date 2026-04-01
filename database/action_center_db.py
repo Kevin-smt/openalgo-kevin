@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 
 from sqlalchemy import Column, DateTime, Index, Integer, String, Text
 from sqlalchemy.sql import func
@@ -15,6 +16,15 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 db_session = Session
+
+
+def _log_timing(label: str, started_at: float, **fields) -> None:
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    extras = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    if extras:
+        logger.info(f"[TIMING] action_center_db | stage={label} | elapsed_ms={elapsed_ms} | {extras}")
+    else:
+        logger.info(f"[TIMING] action_center_db | stage={label} | elapsed_ms={elapsed_ms}")
 
 
 def get_ist_timestamp():
@@ -82,6 +92,7 @@ def create_pending_order(user_id, api_type, order_data):
         int: Pending order ID or None if failed
     """
     try:
+        started_at = time.perf_counter()
         # Convert order_data to JSON string
         order_data_json = json.dumps(order_data)
 
@@ -99,6 +110,13 @@ def create_pending_order(user_id, api_type, order_data):
         logger.info(
             f"Pending order created: ID={pending_order.id}, user={user_id}, type={api_type}, time={pending_order.created_at_ist}"
         )
+        # _log_timing(
+        #     "create_pending_order",
+        #     started_at,
+        #     user_id=user_id,
+        #     api_type=api_type,
+        #     pending_order_id=pending_order.id,
+        # )
         return pending_order.id
 
     except Exception as e:
@@ -143,7 +161,10 @@ def get_pending_order_by_id(order_id):
         PendingOrder or None
     """
     try:
-        return PendingOrder.query.filter_by(id=order_id).first()
+        started_at = time.perf_counter()
+        result = PendingOrder.query.filter_by(id=order_id).first()
+        # _log_timing("get_pending_order_by_id", started_at, order_id=order_id, found=bool(result))
+        return result
     except Exception as e:
         logger.exception(f"Error getting pending order by ID: {e}")
         return None
@@ -162,6 +183,7 @@ def approve_pending_order(order_id, approved_by, user_id):
         bool: True if successful, False otherwise
     """
     try:
+        started_at = time.perf_counter()
         pending_order = PendingOrder.query.filter_by(
             id=order_id, user_id=user_id, status="pending"
         ).first()
@@ -176,6 +198,7 @@ def approve_pending_order(order_id, approved_by, user_id):
             logger.info(
                 f"Order approved: ID={order_id}, by={approved_by}, time={pending_order.approved_at_ist}"
             )
+            # _log_timing("approve_pending_order", started_at, order_id=order_id, user_id=user_id)
             return True
         else:
             logger.warning(f"Cannot approve order {order_id}: not found or not pending")
@@ -201,6 +224,7 @@ def reject_pending_order(order_id, reason, rejected_by, user_id):
         bool: True if successful, False otherwise
     """
     try:
+        started_at = time.perf_counter()
         pending_order = PendingOrder.query.filter_by(
             id=order_id, user_id=user_id, status="pending"
         ).first()
@@ -216,6 +240,7 @@ def reject_pending_order(order_id, reason, rejected_by, user_id):
             logger.info(
                 f"Order rejected: ID={order_id}, by={rejected_by}, time={pending_order.rejected_at_ist}, reason={reason}"
             )
+            # _log_timing("reject_pending_order", started_at, order_id=order_id, user_id=user_id)
             return True
         else:
             logger.warning(f"Cannot reject order {order_id}: not found or not pending")
@@ -274,6 +299,7 @@ def update_broker_status(pending_order_id, broker_order_id, broker_status):
         bool: True if successful, False otherwise
     """
     try:
+        started_at = time.perf_counter()
         pending_order = PendingOrder.query.filter_by(id=pending_order_id).first()
 
         if pending_order:
@@ -284,6 +310,13 @@ def update_broker_status(pending_order_id, broker_order_id, broker_status):
             logger.info(
                 f"Broker status updated: pending_order={pending_order_id}, broker_order={broker_order_id}, status={broker_status}"
             )
+            # _log_timing(
+            #     "update_broker_status",
+            #     started_at,
+            #     pending_order_id=pending_order_id,
+            #     broker_order_id=broker_order_id,
+            #     broker_status=broker_status,
+            # )
             return True
         else:
             logger.warning(f"Cannot update broker status: order {pending_order_id} not found")
@@ -306,7 +339,9 @@ def get_pending_count(user_id):
         int: Count of pending orders
     """
     try:
+        started_at = time.perf_counter()
         count = PendingOrder.query.filter_by(user_id=user_id, status="pending").count()
+        # _log_timing("get_pending_count", started_at, user_id=user_id, count=count)
         return count
     except Exception as e:
         logger.exception(f"Error getting pending count: {e}")

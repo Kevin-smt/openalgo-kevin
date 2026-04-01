@@ -125,9 +125,21 @@ def start_execution_engine(engine_type: str = None):
                 logger.debug("WebSocket execution engine already running")
                 return True, "Execution engine already running (type: websocket)"
 
-        # Determine engine type - default to websocket (with auto-fallback)
+        # Determine engine type - default to polling in local development unless
+        # the caller explicitly forces websocket mode. This avoids starting the
+        # heavier ZMQ/WebSocket stack unless the operator has opted in.
         if engine_type is None:
-            engine_type = os.getenv("SANDBOX_ENGINE_TYPE", "websocket").lower()
+            engine_type = os.getenv("SANDBOX_ENGINE_TYPE")
+            if engine_type:
+                engine_type = engine_type.lower()
+            else:
+                enable_websocket_proxy = os.getenv("ENABLE_WEBSOCKET_PROXY", "false").lower() in (
+                    "1",
+                    "true",
+                    "t",
+                    "yes",
+                )
+                engine_type = "websocket" if enable_websocket_proxy else "polling"
             if os.getenv("SANDBOX_ENGINE_TYPE"):
                 logger.info(f"Sandbox engine type forced by env: {engine_type}")
 
