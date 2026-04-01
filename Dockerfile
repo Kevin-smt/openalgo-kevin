@@ -96,4 +96,4 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # --------------------------------------------------------------------------- #
 USER appuser
 EXPOSE 5000
-CMD ["/app/start.sh"]
+CMD ["/app/.venv/bin/gunicorn", "--worker-class", "eventlet", "--workers", "1", "--bind", "0.0.0.0:5000", "--timeout", "300", "--graceful-timeout", "30", "app:app"]
