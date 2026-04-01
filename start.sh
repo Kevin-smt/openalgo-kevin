@@ -9,10 +9,14 @@ echo "[OpenAlgo] Starting up..."
 ENV_FILE="/app/.env"
 
 # Railway exposes the public HTTP domain as RAILWAY_PUBLIC_DOMAIN.
-# Prefer an explicit HOST_SERVER override, then fall back to Railway, and
-# finally leave the app to fail with a clear error if neither is present.
+# Prefer an explicit HOST_SERVER override, then fall back to Railway's public
+# domain, and finally default to localhost so the app can always start.
 if [ -z "$HOST_SERVER" ] && [ -n "$RAILWAY_PUBLIC_DOMAIN" ]; then
     HOST_SERVER="https://${RAILWAY_PUBLIC_DOMAIN}"
+elif [ -z "$HOST_SERVER" ]; then
+    echo "[OpenAlgo] WARNING: HOST_SERVER not set. Defaulting to http://localhost:5000"
+    echo "[OpenAlgo] Set HOST_SERVER to your public URL for full functionality."
+    HOST_SERVER="http://localhost:5000"
 fi
 
 # Check if .env exists, is readable, and has content (not empty)
@@ -159,19 +163,34 @@ EOF
             echo "[OpenAlgo] Linked .env to /app/.env"
         fi
     else
-        echo "============================================"
-        echo "Error: .env file not found."
-        echo "Solution: Copy .sample.env to .env and configure your settings"
-        echo ""
-        echo "For cloud deployment (Railway/Render), set these environment variables:"
-        echo "  - HOST_SERVER (your app domain, e.g., https://your-app.up.railway.app)"
-        echo "  - REDIRECT_URL (your broker callback URL)"
-        echo "  - BROKER_API_KEY"
-        echo "  - BROKER_API_SECRET"
-        echo "  - APP_KEY (generate with: python -c \"import secrets; print(secrets.token_hex(32))\")"
-        echo "  - API_KEY_PEPPER (generate another one)"
-        echo "============================================"
-        exit 1
+        # HOST_SERVER is always set at this point (either explicitly, via
+        # RAILWAY_PUBLIC_DOMAIN, or defaulted to localhost above), so this
+        # branch is unreachable. Guard it defensively just in case.
+        echo "[OpenAlgo] WARNING: Unexpected state — HOST_SERVER should already be set."
+        echo "[OpenAlgo] Proceeding with HOST_SERVER=http://localhost:5000"
+        HOST_SERVER="http://localhost:5000"
+        # Re-enter the generation block by falling through (HOST_SERVER is now set).
+        # Inline the generation here to avoid restructuring the entire if/else.
+        HOST_DOMAIN="${HOST_SERVER#https://}"
+        HOST_DOMAIN="${HOST_DOMAIN#http://}"
+        if ! touch "$ENV_FILE" 2>/dev/null; then
+            ENV_FILE="/tmp/.env"
+        fi
+        APP_PORT="${PORT:-5000}"
+        cat > "$ENV_FILE" << EOF
+# OpenAlgo Environment Configuration File
+# Auto-generated from environment variables
+ENV_CONFIG_VERSION = '${ENV_CONFIG_VERSION:-1.0.4}'
+HOST_SERVER = '${HOST_SERVER}'
+FLASK_HOST_IP = '0.0.0.0'
+FLASK_PORT = '${APP_PORT}'
+FLASK_DEBUG = '${FLASK_DEBUG:-False}'
+FLASK_ENV = '${FLASK_ENV:-production}'
+EOF
+        echo "[OpenAlgo] Minimal .env generated at $ENV_FILE"
+        if [ "$ENV_FILE" = "/tmp/.env" ]; then
+            ln -sf /tmp/.env /app/.env 2>/dev/null || cp /tmp/.env /app/.env 2>/dev/null || true
+        fi
     fi
 fi
 
