@@ -20,6 +20,7 @@ from pathlib import Path
 
 import psutil
 import pytz
+from cachetools import TTLCache
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import (
@@ -57,6 +58,7 @@ PROCESS_LOCK = threading.Lock()  # Thread lock for process operations
 # SSE (Server-Sent Events) for real-time status updates
 SSE_SUBSCRIBERS = []  # List of Queue objects for SSE clients
 SSE_LOCK = threading.Lock()
+_active_broker_cache = TTLCache(maxsize=1, ttl=30)
 
 
 def broadcast_status_update(strategy_id: str, status: str, message: str = None):
@@ -210,6 +212,10 @@ def ensure_directories():
 
 def get_active_broker():
     """Get the active broker from database (last logged in user's broker)"""
+    cache_key = "active_broker"
+    if cache_key in _active_broker_cache:
+        return _active_broker_cache[cache_key]
+
     try:
         from sqlalchemy import desc
 
@@ -218,6 +224,7 @@ def get_active_broker():
         # Get the most recent auth entry (last logged in user)
         auth_obj = Auth.query.filter_by(is_revoked=False).order_by(desc(Auth.id)).first()
         if auth_obj:
+            _active_broker_cache[cache_key] = auth_obj.broker
             return auth_obj.broker
         return None
     except Exception as e:

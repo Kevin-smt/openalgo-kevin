@@ -77,7 +77,7 @@ def copy_from_dataframe(df):
             engine,
             SymToken,
             filtered_data_dict,
-            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "500")),
+            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "10000")),
             logger=logger,
             label="Master contract",
         )

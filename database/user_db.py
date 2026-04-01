@@ -1,6 +1,7 @@
 # database/user_db.py
 
 import os
+from contextlib import contextmanager
 
 import pyotp
 from argon2 import PasswordHasher
@@ -9,7 +10,7 @@ from cachetools import TTLCache
 from sqlalchemy import Boolean, Column, Integer, String
 from sqlalchemy.exc import IntegrityError
 
-from database.db import Base, Session, engine
+from database.db import Base, Session, SessionLocal, engine
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,6 +40,19 @@ PASSWORD_PEPPER = _pepper_value
 # Engine and session setup
 db_session = Session
 
+
+@contextmanager
+def _session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
 # Define a cache for the usernames with a max size and a 30-second TTL
 username_cache = TTLCache(maxsize=1024, ttl=30)
 
@@ -62,10 +76,6 @@ class User(Base):
         peppered_password = password + PASSWORD_PEPPER
         try:
             ph.verify(self.password_hash, peppered_password)
-            # Check if the hash needs to be updated
-            if ph.check_needs_rehash(self.password_hash):
-                self.set_password(password)
-                db_session.commit()
             return True
         except VerifyMismatchError:
             return False
@@ -90,15 +100,20 @@ def init_db():
 
 def add_user(username, email, password, is_admin=False):
     try:
-        # Generate TOTP secret for the user
-        totp_secret = pyotp.random_base32()
-        user = User(username=username, email=email, totp_secret=totp_secret, is_admin=is_admin)
-        user.set_password(password)
-        db_session.add(user)
-        db_session.commit()
-        return user  # Return the user object instead of True
+        with _session_scope() as session:
+            # Generate TOTP secret for the user
+            totp_secret = pyotp.random_base32()
+            user = User(
+                username=username,
+                email=email,
+                totp_secret=totp_secret,
+                is_admin=is_admin,
+            )
+            user.set_password(password)
+            session.add(user)
+            session.flush()
+            return user  # Return the user object instead of True
     except IntegrityError:
-        db_session.rollback()
         return None  # Return None instead of False
 
 
@@ -113,22 +128,32 @@ def authenticate_user(username, password):
         else:
             del username_cache[cache_key]  # Remove invalid cache entry
             return False
-    else:
-        user = User.query.filter_by(username=username).first()
-        if user and user.check_password(password):
-            username_cache[cache_key] = user  # Cache the User object
-            return True
-        return False
+    with _session_scope() as session:
+        user = session.query(User).filter_by(username=username).first()
+        if not user:
+            return False
+
+        if not user.check_password(password):
+            return False
+
+        if ph.check_needs_rehash(user.password_hash):
+            user.set_password(password)
+            session.add(user)
+
+        username_cache[cache_key] = user  # Cache the User object
+        return True
 
 
 def find_user_by_email(email):
     """Find user by email for password reset"""
-    return User.query.filter_by(email=email).first()
+    with SessionLocal() as session:
+        return session.query(User).filter_by(email=email).first()
 
 
 def find_user_by_username():
     """Find admin user"""
-    return User.query.filter_by(is_admin=True).first()
+    with SessionLocal() as session:
+        return session.query(User).filter_by(is_admin=True).first()
 
 
 def rehash_all_passwords():
@@ -137,12 +162,12 @@ def rehash_all_passwords():
     This should be called once when upgrading from the old hashing method.
     Requires knowing the original passwords or having users reset them.
     """
-    users = User.query.all()
-    for user in users:
-        if user.password_hash.startswith("pbkdf2:sha256"):  # Old Werkzeug format
-            # At this point, you would either:
-            # 1. Have users reset their passwords
-            # 2. Or if you have access to original passwords (during migration):
-            #    user.set_password(original_password)
-            pass
-    db_session.commit()
+    with _session_scope() as session:
+        users = session.query(User).all()
+        for user in users:
+            if user.password_hash.startswith("pbkdf2:sha256"):  # Old Werkzeug format
+                # At this point, you would either:
+                # 1. Have users reset their passwords
+                # 2. Or if you have access to original passwords (during migration):
+                #    user.set_password(original_password)
+                pass

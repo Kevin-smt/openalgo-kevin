@@ -240,10 +240,7 @@ def validate_database_connections() -> bool:
             errors.append(f"{env_var} is empty and could not be resolved.")
             continue
 
-        if not database_url.startswith("postgresql"):
-            errors.append(
-                f"{env_var} resolved to a non-PostgreSQL URL and cannot be used at runtime: {database_url}"
-            )
+        if database_url.startswith("sqlite"):
             continue
 
         engine = get_engine(database_url)
@@ -261,13 +258,13 @@ def validate_database_connections() -> bool:
 
     if errors:
         print("\n" + "=" * 70)
-        print("❌ PostgreSQL preflight check failed")
+        print("❌ Database preflight check failed")
         print("=" * 70)
         for error in errors:
             print(f"- {error}")
         print("")
         print("Make sure the PostgreSQL server is running and the databases exist.")
-        print("If this is a local setup, OpenAlgo will try to create missing databases automatically on startup.")
+        print("SQLite fallbacks are allowed for local development when DATABASE_URL is unset.")
         print("=" * 70)
         return False
 
@@ -312,11 +309,6 @@ def load_and_check_env_variables() -> None:
     # DATABASE_URL directly from the environment.
     configure_database_environment()
 
-    if not os.getenv("DATABASE_URL"):
-        print("Error: DATABASE_URL could not be resolved from the active profile.")
-        print("Solution: Set DATABASE_URL directly or provide the LOCAL_DB_* / PROD_DB_* variables.")
-        sys.exit(1)
-
     # Create missing local PostgreSQL databases before any DB engine is initialized.
     try:
         created_databases = ensure_runtime_postgres_databases_exist()
@@ -327,9 +319,11 @@ def load_and_check_env_variables() -> None:
         print(f"Details: {e}")
         sys.exit(1)
 
-    # Fail fast with a precise message if any of the runtime databases is still unreachable.
+    # Validate runtime databases, but do not hard-stop startup here.
+    # Remote DB connectivity can be transient; the app should still boot so
+    # routes, diagnostics, and background recovery logic remain available.
     if not validate_database_connections():
-        sys.exit(1)
+        print("\nWarning: continuing startup even though one or more databases are unreachable.")
 
     # Define the required environment variables
     required_vars = [

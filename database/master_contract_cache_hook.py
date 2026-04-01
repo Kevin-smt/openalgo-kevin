@@ -28,7 +28,7 @@ def should_load_symbol_cache() -> bool:
     return get_runtime_environment() != "production"
 
 
-def load_symbols_to_cache(broker: str) -> bool:
+def load_symbols_to_cache(broker: str, *, force: bool = False) -> bool:
     """
     Load all symbols into memory cache after master contract download
     This function is called automatically when master contract download completes
@@ -40,7 +40,7 @@ def load_symbols_to_cache(broker: str) -> bool:
         bool: True if cache loaded successfully, False otherwise
     """
     try:
-        if not should_load_symbol_cache():
+        if not force and not should_load_symbol_cache():
             logger.info(
                 "Skipping in-memory symbol cache load for broker %s because "
                 "ENABLE_SYMBOL_CACHE_LOAD is disabled",
@@ -116,7 +116,7 @@ def hook_into_master_contract_download(broker: str):
         time.sleep(0.5)
 
         # Load symbols into cache
-        load_symbols_to_cache(broker)
+        load_symbols_to_cache(broker, force=True)
 
         # After successful master contract download, restore Python strategies
         try:
@@ -171,7 +171,7 @@ def refresh_cache_if_needed(broker: str):
         # Check if cache is valid
         if not cache.is_cache_valid():
             logger.info(f"Cache expired or invalid for broker: {broker}. Reloading...")
-            load_symbols_to_cache(broker)
+            load_symbols_to_cache(broker, force=False)
         else:
             logger.debug(f"Cache is still valid for broker: {broker}")
 

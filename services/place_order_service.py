@@ -14,6 +14,7 @@ from database.trading_db import (
 )
 from events import AnalyzerErrorEvent, OrderFailedEvent, OrderPlacedEvent
 from restx_api.schemas import OrderSchema
+from utils.api_timer import APITimer
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -129,6 +130,8 @@ def place_order_with_auth(
     original_data: dict[str, Any],
     emit_event: bool = True,
     user_id: str | None = None,
+    analyze_mode: bool | None = None,
+    timer: APITimer | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order using provided auth token.
@@ -159,8 +162,14 @@ def place_order_with_auth(
         bool(api_key),
     )
 
+    if timer:
+        timer.checkpoint("symbol_lookup_db")
+
     # If in analyze mode, route to sandbox for virtual trading
-    if get_analyze_mode():
+    if analyze_mode is None:
+        analyze_mode = get_analyze_mode()
+
+    if analyze_mode:
         from services.sandbox_service import sandbox_place_order
 
         if not api_key:
@@ -209,6 +218,8 @@ def place_order_with_auth(
         return False, error_response, 404
 
     try:
+        if timer:
+            timer.checkpoint("broker_api_call")
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
     except Exception as e:
         logger.error(f"Error in broker_module.place_order_api: {e}")
@@ -230,6 +241,8 @@ def place_order_with_auth(
         return False, error_response, 500
 
     if res.status == 200:
+        if timer:
+            timer.checkpoint("dedup_check_db")
         order_response_data = {"status": "success", "orderid": order_id}
         resolved_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
         logger.info(
@@ -259,6 +272,8 @@ def place_order_with_auth(
             f"[LEDGER DEBUG] Attempting mirror_live_order for user={resolved_user_id}, broker={broker}, "
             f"symbol={order_data.get('symbol')}, orderid={order_id}"
         )
+        if timer:
+            timer.checkpoint("order_write_db")
         mirrored = mirror_live_order(
             order_data=order_data,
             broker=broker,
@@ -341,6 +356,8 @@ def place_order(
     broker: str | None = None,
     emit_event: bool = True,
     user_id: str | None = None,
+    analyze_mode: bool | None = None,
+    timer: APITimer | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order with the broker.
@@ -405,6 +422,8 @@ def place_order(
             original_data,
             emit_event,
             user_id=user_id,
+            analyze_mode=analyze_mode,
+            timer=timer,
         )
 
     # Case 2: Direct internal call with auth_token and broker
@@ -416,6 +435,8 @@ def place_order(
             original_data,
             emit_event,
             user_id=user_id,
+            analyze_mode=analyze_mode,
+            timer=timer,
         )
 
     # Case 3: Invalid parameters

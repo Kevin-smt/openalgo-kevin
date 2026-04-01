@@ -16,18 +16,32 @@ Follows industry standards (draft-inadarei-api-health-check):
 
 import logging
 import os
+from contextlib import contextmanager
 from datetime import timedelta
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String
 from sqlalchemy.sql import func
 
-from database.db import Base, Session, engine
+from database.db import Base, Session, SessionLocal, engine
 from utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
 health_session = Session
 HealthBase = Base
+
+
+@contextmanager
+def _session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 class HealthMetric(HealthBase):
@@ -145,19 +159,23 @@ class HealthMetric(HealthBase):
                 overall_status=overall_status,
             )
 
-            health_session.add(metric)
-            health_session.commit()
+            with _session_scope() as session:
+                session.add(metric)
             return True
         except Exception as e:
             logger.exception(f"Error logging health metrics: {str(e)}")
-            health_session.rollback()
             return False
 
     @staticmethod
     def get_current_metrics():
         """Get most recent metrics"""
         try:
-            return HealthMetric.query.order_by(HealthMetric.timestamp.desc()).first()
+            with SessionLocal() as session:
+                return (
+                    session.query(HealthMetric)
+                    .order_by(HealthMetric.timestamp.desc())
+                    .first()
+                )
         except Exception as e:
             logger.exception(f"Error getting current metrics: {str(e)}")
             return None
@@ -166,9 +184,13 @@ class HealthMetric(HealthBase):
     def get_recent_metrics(limit=100):
         """Get recent metrics ordered by timestamp"""
         try:
-            return (
-                HealthMetric.query.order_by(HealthMetric.timestamp.desc()).limit(limit).all()
-            )
+            with SessionLocal() as session:
+                return (
+                    session.query(HealthMetric)
+                    .order_by(HealthMetric.timestamp.desc())
+                    .limit(limit)
+                    .all()
+                )
         except Exception as e:
             logger.exception(f"Error getting recent metrics: {str(e)}")
             return []
@@ -178,11 +200,13 @@ class HealthMetric(HealthBase):
         """Get metrics for the specified number of hours"""
         try:
             cutoff = now_ist() - timedelta(hours=hours)
-            return (
-                HealthMetric.query.filter(HealthMetric.timestamp >= cutoff)
-                .order_by(HealthMetric.timestamp.asc())
-                .all()
-            )
+            with SessionLocal() as session:
+                return (
+                    session.query(HealthMetric)
+                    .filter(HealthMetric.timestamp >= cutoff)
+                    .order_by(HealthMetric.timestamp.asc())
+                    .all()
+                )
         except Exception as e:
             logger.exception(f"Error getting metrics history: {str(e)}")
             return []
@@ -194,99 +218,101 @@ class HealthMetric(HealthBase):
             cutoff = now_ist() - timedelta(hours=hours)
 
             # Get metrics for the time period
-            metrics = (
-                HealthMetric.query.filter(HealthMetric.timestamp >= cutoff)
-                .order_by(HealthMetric.timestamp.asc())
-                .all()
-            )
+            with SessionLocal() as session:
+                metrics = (
+                    session.query(HealthMetric)
+                    .filter(HealthMetric.timestamp >= cutoff)
+                    .order_by(HealthMetric.timestamp.asc())
+                    .all()
+                )
 
-            if not metrics:
+                if not metrics:
+                    return {
+                        "total_samples": 0,
+                        "time_period_hours": hours,
+                        "fd": {},
+                        "memory": {},
+                        "database": {},
+                        "websocket": {},
+                        "threads": {},
+                        "status": {},
+                    }
+
+                # Calculate statistics
+                fd_counts = [m.fd_count for m in metrics if m.fd_count is not None]
+                memory_rss = [m.memory_rss_mb for m in metrics if m.memory_rss_mb is not None]
+                db_conns = [
+                    m.db_connections_total for m in metrics if m.db_connections_total is not None
+                ]
+                ws_conns = [
+                    m.ws_connections_total for m in metrics if m.ws_connections_total is not None
+                ]
+                threads = [m.thread_count for m in metrics if m.thread_count is not None]
+
+                # Count status occurrences
+                fd_fail_count = sum(1 for m in metrics if m.fd_status == "fail")
+                fd_warn_count = sum(1 for m in metrics if m.fd_status == "warn")
+                memory_fail_count = sum(1 for m in metrics if m.memory_status == "fail")
+                memory_warn_count = sum(1 for m in metrics if m.memory_status == "warn")
+                db_fail_count = sum(1 for m in metrics if m.db_status == "fail")
+                db_warn_count = sum(1 for m in metrics if m.db_status == "warn")
+                ws_fail_count = sum(1 for m in metrics if m.ws_status == "fail")
+                ws_warn_count = sum(1 for m in metrics if m.ws_status == "warn")
+                thread_fail_count = sum(1 for m in metrics if m.thread_status == "fail")
+                thread_warn_count = sum(1 for m in metrics if m.thread_status == "warn")
+                overall_fail_count = sum(1 for m in metrics if m.overall_status == "fail")
+                overall_warn_count = sum(1 for m in metrics if m.overall_status == "warn")
+
                 return {
-                    "total_samples": 0,
+                    "total_samples": len(metrics),
                     "time_period_hours": hours,
-                    "fd": {},
-                    "memory": {},
-                    "database": {},
-                    "websocket": {},
-                    "threads": {},
-                    "status": {},
-                }
-
-            # Calculate statistics
-            fd_counts = [m.fd_count for m in metrics if m.fd_count is not None]
-            memory_rss = [m.memory_rss_mb for m in metrics if m.memory_rss_mb is not None]
-            db_conns = [
-                m.db_connections_total for m in metrics if m.db_connections_total is not None
-            ]
-            ws_conns = [
-                m.ws_connections_total for m in metrics if m.ws_connections_total is not None
-            ]
-            threads = [m.thread_count for m in metrics if m.thread_count is not None]
-
-            # Count status occurrences
-            fd_fail_count = sum(1 for m in metrics if m.fd_status == "fail")
-            fd_warn_count = sum(1 for m in metrics if m.fd_status == "warn")
-            memory_fail_count = sum(1 for m in metrics if m.memory_status == "fail")
-            memory_warn_count = sum(1 for m in metrics if m.memory_status == "warn")
-            db_fail_count = sum(1 for m in metrics if m.db_status == "fail")
-            db_warn_count = sum(1 for m in metrics if m.db_status == "warn")
-            ws_fail_count = sum(1 for m in metrics if m.ws_status == "fail")
-            ws_warn_count = sum(1 for m in metrics if m.ws_status == "warn")
-            thread_fail_count = sum(1 for m in metrics if m.thread_status == "fail")
-            thread_warn_count = sum(1 for m in metrics if m.thread_status == "warn")
-            overall_fail_count = sum(1 for m in metrics if m.overall_status == "fail")
-            overall_warn_count = sum(1 for m in metrics if m.overall_status == "warn")
-
-            return {
-                "total_samples": len(metrics),
-                "time_period_hours": hours,
-                "fd": {
-                    "current": fd_counts[-1] if fd_counts else 0,
-                    "avg": sum(fd_counts) / len(fd_counts) if fd_counts else 0,
-                    "min": min(fd_counts) if fd_counts else 0,
-                    "max": max(fd_counts) if fd_counts else 0,
-                    "fail_count": fd_fail_count,
-                    "warn_count": fd_warn_count,
-                },
-                "memory": {
-                    "current_mb": memory_rss[-1] if memory_rss else 0,
-                    "avg_mb": sum(memory_rss) / len(memory_rss) if memory_rss else 0,
-                    "min_mb": min(memory_rss) if memory_rss else 0,
-                    "max_mb": max(memory_rss) if memory_rss else 0,
-                    "fail_count": memory_fail_count,
-                    "warn_count": memory_warn_count,
-                },
-                "database": {
-                    "current": db_conns[-1] if db_conns else 0,
-                    "avg": sum(db_conns) / len(db_conns) if db_conns else 0,
-                    "min": min(db_conns) if db_conns else 0,
-                    "max": max(db_conns) if db_conns else 0,
-                },
-                "websocket": {
-                    "current": ws_conns[-1] if ws_conns else 0,
-                    "avg": sum(ws_conns) / len(ws_conns) if ws_conns else 0,
-                    "min": min(ws_conns) if ws_conns else 0,
-                    "max": max(ws_conns) if ws_conns else 0,
-                },
-                "threads": {
-                    "current": threads[-1] if threads else 0,
-                    "avg": sum(threads) / len(threads) if threads else 0,
-                    "min": min(threads) if threads else 0,
-                    "max": max(threads) if threads else 0,
-                },
-                "status": {
-                    "overall": {
-                        "pass": len(metrics) - (overall_warn_count + overall_fail_count),
-                        "warn": overall_warn_count,
-                        "fail": overall_fail_count,
+                    "fd": {
+                        "current": fd_counts[-1] if fd_counts else 0,
+                        "avg": sum(fd_counts) / len(fd_counts) if fd_counts else 0,
+                        "min": min(fd_counts) if fd_counts else 0,
+                        "max": max(fd_counts) if fd_counts else 0,
+                        "fail_count": fd_fail_count,
+                        "warn_count": fd_warn_count,
                     },
-                    "fd": {"warn": fd_warn_count, "fail": fd_fail_count},
-                    "memory": {"warn": memory_warn_count, "fail": memory_fail_count},
-                    "database": {"warn": db_warn_count, "fail": db_fail_count},
-                    "websocket": {"warn": ws_warn_count, "fail": ws_fail_count},
-                    "threads": {"warn": thread_warn_count, "fail": thread_fail_count},
-                },
-            }
+                    "memory": {
+                        "current_mb": memory_rss[-1] if memory_rss else 0,
+                        "avg_mb": sum(memory_rss) / len(memory_rss) if memory_rss else 0,
+                        "min_mb": min(memory_rss) if memory_rss else 0,
+                        "max_mb": max(memory_rss) if memory_rss else 0,
+                        "fail_count": memory_fail_count,
+                        "warn_count": memory_warn_count,
+                    },
+                    "database": {
+                        "current": db_conns[-1] if db_conns else 0,
+                        "avg": sum(db_conns) / len(db_conns) if db_conns else 0,
+                        "min": min(db_conns) if db_conns else 0,
+                        "max": max(db_conns) if db_conns else 0,
+                    },
+                    "websocket": {
+                        "current": ws_conns[-1] if ws_conns else 0,
+                        "avg": sum(ws_conns) / len(ws_conns) if ws_conns else 0,
+                        "min": min(ws_conns) if ws_conns else 0,
+                        "max": max(ws_conns) if ws_conns else 0,
+                    },
+                    "threads": {
+                        "current": threads[-1] if threads else 0,
+                        "avg": sum(threads) / len(threads) if threads else 0,
+                        "min": min(threads) if threads else 0,
+                        "max": max(threads) if threads else 0,
+                    },
+                    "status": {
+                        "overall": {
+                            "pass": len(metrics) - (overall_warn_count + overall_fail_count),
+                            "warn": overall_warn_count,
+                            "fail": overall_fail_count,
+                        },
+                        "fd": {"warn": fd_warn_count, "fail": fd_fail_count},
+                        "memory": {"warn": memory_warn_count, "fail": memory_fail_count},
+                        "database": {"warn": db_warn_count, "fail": db_fail_count},
+                        "websocket": {"warn": ws_warn_count, "fail": ws_fail_count},
+                        "threads": {"warn": thread_warn_count, "fail": thread_fail_count},
+                    },
+                }
         except Exception as e:
             logger.exception(f"Error getting stats: {str(e)}")
             return {}
@@ -317,47 +343,45 @@ class HealthAlert(HealthBase):
     def create_alert(alert_type, severity, metric_name, metric_value, threshold_value, message):
         """Create a new alert"""
         try:
-            # Check if similar alert already exists (not resolved)
-            existing = (
-                HealthAlert.query.filter_by(alert_type=alert_type, resolved=False)
-                .order_by(HealthAlert.timestamp.desc())
-                .first()
-            )
+            with _session_scope() as session:
+                existing = (
+                    session.query(HealthAlert)
+                    .filter_by(alert_type=alert_type, resolved=False)
+                    .order_by(HealthAlert.timestamp.desc())
+                    .first()
+                )
 
-            if existing:
-                # Update existing alert timestamp
-                existing.timestamp = now_ist()
-                existing.metric_value = metric_value
-                health_session.commit()
-                return existing
+                if existing:
+                    existing.timestamp = now_ist()
+                    existing.metric_value = metric_value
+                    return existing
 
-            # Create new alert
-            alert = HealthAlert(
-                alert_type=alert_type,
-                severity=severity,
-                metric_name=metric_name,
-                metric_value=metric_value,
-                threshold_value=threshold_value,
-                message=message,
-            )
-            health_session.add(alert)
-            health_session.commit()
-            logger.warning(f"Health alert created: {message}")
-            return alert
+                alert = HealthAlert(
+                    alert_type=alert_type,
+                    severity=severity,
+                    metric_name=metric_name,
+                    metric_value=metric_value,
+                    threshold_value=threshold_value,
+                    message=message,
+                )
+                session.add(alert)
+                logger.warning(f"Health alert created: {message}")
+                return alert
         except Exception as e:
             logger.exception(f"Error creating alert: {str(e)}")
-            health_session.rollback()
             return None
 
     @staticmethod
     def get_active_alerts():
         """Get all active (not resolved) alerts"""
         try:
-            return (
-                HealthAlert.query.filter_by(resolved=False)
-                .order_by(HealthAlert.timestamp.desc())
-                .all()
-            )
+            with SessionLocal() as session:
+                return (
+                    session.query(HealthAlert)
+                    .filter_by(resolved=False)
+                    .order_by(HealthAlert.timestamp.desc())
+                    .all()
+                )
         except Exception as e:
             logger.exception(f"Error getting active alerts: {str(e)}")
             return []
@@ -366,56 +390,62 @@ class HealthAlert(HealthBase):
     def acknowledge_alert(alert_id):
         """Acknowledge an alert"""
         try:
-            alert = HealthAlert.query.get(alert_id)
-            if alert:
-                alert.acknowledged = True
-                alert.acknowledged_at = now_ist()
-                health_session.commit()
-                return True
+            with _session_scope() as session:
+                alert = session.get(HealthAlert, alert_id)
+                if alert:
+                    alert.acknowledged = True
+                    alert.acknowledged_at = now_ist()
+                    return True
             return False
         except Exception as e:
             logger.exception(f"Error acknowledging alert: {str(e)}")
-            health_session.rollback()
             return False
 
     @staticmethod
     def resolve_alert(alert_id):
         """Resolve an alert"""
         try:
-            alert = HealthAlert.query.get(alert_id)
-            if alert:
-                alert.resolved = True
-                alert.resolved_at = now_ist()
-                health_session.commit()
-                logger.info(f"Alert resolved: {alert.message}")
-                return True
+            with _session_scope() as session:
+                alert = session.get(HealthAlert, alert_id)
+                if alert:
+                    alert.resolved = True
+                    alert.resolved_at = now_ist()
+                    logger.info(f"Alert resolved: {alert.message}")
+                    return True
             return False
         except Exception as e:
             logger.exception(f"Error resolving alert: {str(e)}")
-            health_session.rollback()
             return False
 
     @staticmethod
     def auto_resolve_alerts(metric_name, current_value, healthy_threshold):
         """Automatically resolve alerts when metrics return to healthy range"""
         try:
-            # Get active alerts for this metric
-            alerts = HealthAlert.query.filter_by(metric_name=metric_name, resolved=False).all()
+            if current_value >= healthy_threshold:
+                return
 
-            for alert in alerts:
-                # Resolve if current value is below healthy threshold
-                if current_value < healthy_threshold:
-                    alert.resolved = True
-                    alert.resolved_at = now_ist()
+            with _session_scope() as session:
+                alert_query = session.query(HealthAlert).filter_by(
+                    metric_name=metric_name, resolved=False
+                )
+                alerts = alert_query.all()
+                if not alerts:
+                    return
+
+                alert_query.update(
+                    {
+                        HealthAlert.resolved: True,
+                        HealthAlert.resolved_at: now_ist(),
+                    },
+                    synchronize_session=False,
+                )
+                for alert in alerts:
                     logger.info(
                         f"Auto-resolved alert: {alert.message} "
                         f"(current: {current_value}, threshold: {healthy_threshold})"
                     )
-
-            health_session.commit()
         except Exception as e:
             logger.exception(f"Error auto-resolving alerts: {str(e)}")
-            health_session.rollback()
 
 
 def init_health_db():
@@ -433,17 +463,14 @@ def purge_old_metrics(days=7):
     try:
         cutoff = now_ist() - timedelta(days=days)
 
-        # Delete old metrics
-        deleted = (
-            health_session.query(HealthMetric)
-            .filter(HealthMetric.timestamp < cutoff)
-            .delete(synchronize_session=False)
-        )
-
-        health_session.commit()
+        with _session_scope() as session:
+            deleted = (
+                session.query(HealthMetric)
+                .filter(HealthMetric.timestamp < cutoff)
+                .delete(synchronize_session=False)
+            )
         logger.debug(f"Purged {deleted} old health metrics (older than {days} days)")
         return deleted
     except Exception as e:
         logger.exception(f"Error purging old metrics: {str(e)}")
-        health_session.rollback()
         return 0

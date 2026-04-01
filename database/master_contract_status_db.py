@@ -1,11 +1,15 @@
 import json
 import logging
 import os
+import threading
 from datetime import date, timedelta
+from contextlib import contextmanager
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, Text, text
+from cachetools import TTLCache
+from sqlalchemy import Boolean, Column, Date, DateTime, Integer, String, Text, inspect, text
 
 from database.db import Base, Session, engine
+from database.db_init_helper import init_db_with_logging
 from utils.timezone import ensure_ist, now_ist
 
 
@@ -19,6 +23,49 @@ DOWNLOAD_TIMEOUT_MINUTES = 5
 # Get the database path from environment variable or use default
 DB_PATH = os.getenv("DATABASE_URL", "")
 SessionLocal = Session
+_SYM_TOKEN_SCHEMA_READY = False
+_status_cache = TTLCache(maxsize=256, ttl=int(os.getenv("MASTER_CONTRACT_STATUS_TTL", "10")))
+_cache_lock = threading.Lock()
+
+
+def _cache_get(key):
+    with _cache_lock:
+        return _status_cache.get(key)
+
+
+def _cache_set(key, value):
+    with _cache_lock:
+        _status_cache[key] = value
+
+
+def _cache_clear():
+    with _cache_lock:
+        _status_cache.clear()
+
+
+def _ensure_symtoken_table() -> bool:
+    """Create the master contract symbol table(s) if missing."""
+    global _SYM_TOKEN_SCHEMA_READY
+    if _SYM_TOKEN_SCHEMA_READY:
+        return True
+
+    try:
+        if inspect(engine).has_table("symtoken"):
+            _SYM_TOKEN_SCHEMA_READY = True
+            return True
+    except Exception as exc:
+        logger.debug(f"Could not inspect symtoken table; will try to initialize it: {exc}")
+
+    try:
+        from database.symbol import init_db as init_symbol_db
+
+        init_symbol_db()
+        _SYM_TOKEN_SCHEMA_READY = True
+        logger.info("Created missing symtoken table(s) via master contract DB init")
+        return True
+    except Exception as exc:
+        logger.exception(f"Failed to create missing symtoken table(s): {exc}")
+        return False
 
 
 class MasterContractStatus(Base):
@@ -38,8 +85,9 @@ class MasterContractStatus(Base):
     download_duration_seconds = Column(Integer, nullable=True)  # How long download took
 
 
-# Create table if it doesn't exist
-Base.metadata.create_all(bind=engine)
+def init_db():
+    """Initialize the master contract status table."""
+    init_db_with_logging(Base, engine, "Master Contract Status DB", logger)
 
 
 def init_broker_status(broker):
@@ -67,6 +115,7 @@ def init_broker_status(broker):
             session.add(status)
 
         session.commit()
+        _cache_clear()
         logger.info(f"Initialized master contract status for {broker}")
 
     except Exception as e:
@@ -103,6 +152,7 @@ def update_status(broker, status, message, total_symbols=None):
             session.add(broker_status)
 
         session.commit()
+        _cache_clear()
         logger.info(f"Updated master contract status for {broker}: {status}")
 
     except Exception as e:
@@ -114,6 +164,10 @@ def update_status(broker, status, message, total_symbols=None):
 
 def get_status(broker):
     """Get the current status for a broker"""
+    cached = _cache_get(("status", broker))
+    if cached is not None:
+        return cached
+
     session = SessionLocal()
     try:
         status = session.query(MasterContractStatus).filter_by(broker=broker).first()
@@ -146,7 +200,7 @@ def get_status(broker):
                 except json.JSONDecodeError:
                     exchange_stats = None
 
-            return {
+            result = {
                 "broker": status.broker,
                 "status": status.status,
                 "message": status.message,
@@ -159,8 +213,10 @@ def get_status(broker):
                 "exchange_stats": exchange_stats,
                 "download_duration_seconds": status.download_duration_seconds,
             }
+            _cache_set(("status", broker), result)
+            return result
         else:
-            return {
+            result = {
                 "broker": broker,
                 "status": "unknown",
                 "message": "No status available",
@@ -172,9 +228,11 @@ def get_status(broker):
                 "exchange_stats": None,
                 "download_duration_seconds": None,
             }
+            _cache_set(("status", broker), result)
+            return result
     except Exception as e:
         logger.exception(f"Error getting status for {broker}: {str(e)}")
-        return {
+        result = {
             "broker": broker,
             "status": "error",
             "message": f"Error retrieving status: {str(e)}",
@@ -186,16 +244,23 @@ def get_status(broker):
             "exchange_stats": None,
             "download_duration_seconds": None,
         }
+        return result
     finally:
         session.close()
 
 
 def check_if_ready(broker):
     """Check if master contracts are ready for a broker"""
+    cached = _cache_get(("ready", broker))
+    if cached is not None:
+        return cached
+
     session = SessionLocal()
     try:
         status = session.query(MasterContractStatus).filter_by(broker=broker).first()
-        return status.is_ready if status else False
+        result = status.is_ready if status else False
+        _cache_set(("ready", broker), result)
+        return result
     except Exception as e:
         logger.exception(f"Error checking if ready for {broker}: {str(e)}")
         return False
@@ -205,10 +270,16 @@ def check_if_ready(broker):
 
 def get_last_download_time(broker):
     """Get the last successful download time for a broker"""
+    cached = _cache_get(("last_download", broker))
+    if cached is not None:
+        return cached
+
     session = SessionLocal()
     try:
         status = session.query(MasterContractStatus).filter_by(broker=broker).first()
-        return ensure_ist(status.last_download_time) if status and status.last_download_time else None
+        result = ensure_ist(status.last_download_time) if status and status.last_download_time else None
+        _cache_set(("last_download", broker), result)
+        return result
     except Exception as e:
         logger.exception(f"Error getting last download time for {broker}: {str(e)}")
         return None
@@ -228,6 +299,7 @@ def update_download_stats(broker, duration_seconds, exchange_stats=None):
             if exchange_stats:
                 status.exchange_stats = json.dumps(exchange_stats)
             session.commit()
+            _cache_clear()
             logger.info(f"Updated download stats for {broker}: {duration_seconds}s")
     except Exception as e:
         logger.exception(f"Error updating download stats for {broker}: {str(e)}")
@@ -247,6 +319,7 @@ def mark_status_ready_without_download(broker):
             status.message = "Using cached master contract"
             status.last_updated = _now_ist_aware()
             session.commit()
+            _cache_clear()
             logger.info(f"Marked existing master contract as ready for {broker}")
             return True
         return False
@@ -261,20 +334,30 @@ def mark_status_ready_without_download(broker):
 def get_exchange_stats_from_db():
     """Get exchange-wise symbol counts from symtoken table"""
     try:
+        cached = _cache_get(("exchange_stats", "symtoken"))
+        if cached is not None:
+            return cached
+
+        if not _ensure_symtoken_table():
+            return {}
+
         # Query symtoken table directly using raw SQL
         with engine.connect() as conn:
-            result = conn.execute(text("""
-                SELECT
-                    exchange,
-                    COUNT(*) as total
-                FROM symtoken
-                GROUP BY exchange
-                ORDER BY total DESC
-            """)).fetchall()
+            result = conn.execute(
+                text(
+                    """
+                    SELECT
+                        exchange,
+                        COUNT(*) as total
+                    FROM symtoken
+                    GROUP BY exchange
+                    ORDER BY total DESC
+                    """
+                )
+            ).fetchall()
 
-            stats = {}
-            for row in result:
-                stats[row[0]] = row[1]
+            stats = {row[0]: row[1] for row in result}
+            _cache_set(("exchange_stats", "symtoken"), stats)
             return stats
     except Exception as e:
         logger.exception(f"Error getting exchange stats: {str(e)}")

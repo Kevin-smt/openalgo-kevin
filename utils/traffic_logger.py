@@ -77,10 +77,14 @@ class TrafficLoggerMiddleware:
 
 def init_traffic_logging(app):
     """Initialize traffic logging middleware"""
-    # Initialize the logs database
+    # Initialize the logs database, but do not block app startup if the remote
+    # database is temporarily unreachable. Traffic logging can recover later.
     from database.traffic_db import init_logs_db
 
-    init_logs_db()
+    try:
+        init_logs_db()
+    except Exception as e:
+        logger.exception(f"Traffic logging DB init failed; continuing startup: {e}")
 
     # Add middleware
     app.wsgi_app = TrafficLoggerMiddleware(app.wsgi_app)

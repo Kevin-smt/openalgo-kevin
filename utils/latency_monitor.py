@@ -248,11 +248,18 @@ def wrap_resource_methods(resource_class, api_type):
 
 def init_latency_monitoring(app):
     """Initialize latency monitoring"""
-    # Initialize the latency database
-    init_latency_db()
+    # Initialize the latency database, but do not fail app startup if the
+    # remote database is temporarily unreachable.
+    try:
+        init_latency_db()
+    except Exception as e:
+        logger.exception(f"Latency DB init failed; continuing startup: {e}")
 
     # Auto-purge old data endpoint logs (keep order logs forever, purge data logs after 7 days)
-    purge_old_data_logs(days=7)
+    try:
+        purge_old_data_logs(days=7)
+    except Exception as e:
+        logger.exception(f"Latency data purge failed; continuing startup: {e}")
 
     # Import all RESTX API resources
     from restx_api import api

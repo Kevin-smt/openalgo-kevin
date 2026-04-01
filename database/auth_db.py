@@ -1,6 +1,7 @@
 # database/auth_db.py
 
 import base64
+import hashlib
 import os
 
 from argon2 import PasswordHasher
@@ -151,6 +152,7 @@ class ApiKeys(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(String, nullable=False, unique=True, index=True)
     api_key_hash = Column(Text, nullable=False, index=True)  # For verification
+    api_key_sha256 = Column(String(64), nullable=True, index=True)
     api_key_encrypted = Column(Text, nullable=False)  # For retrieval
     created_at = Column(DateTime(timezone=True), default=func.now())
     order_mode = Column(String(20), default="auto")  # 'auto' or 'semi_auto'
@@ -166,6 +168,30 @@ def init_db():
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Auth DB", logger)
+    try:
+        from sqlalchemy import inspect, text
+
+        if engine.dialect.name == "postgresql":
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS api_key_sha256 VARCHAR(64)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_api_keys_sha256 ON api_keys(api_key_sha256)"
+                    )
+                )
+        else:
+            inspector = inspect(engine)
+            if "api_keys" in inspector.get_table_names():
+                columns = {column["name"] for column in inspector.get_columns("api_keys")}
+                if "api_key_sha256" not in columns:
+                    with engine.begin() as conn:
+                        conn.execute(text("ALTER TABLE api_keys ADD COLUMN api_key_sha256 VARCHAR(64)"))
+    except Exception as e:
+        logger.debug(f"Auth DB: api_key_sha256 migration skipped or already applied: {e}")
 
 
 def encrypt_token(token):
@@ -407,6 +433,7 @@ def upsert_api_key(user_id, api_key):
     # Hash with Argon2 for verification
     peppered_key = api_key + PEPPER
     hashed_key = ph.hash(peppered_key)
+    api_key_sha256 = hashlib.sha256(api_key.encode()).hexdigest()
 
     # Encrypt for retrieval
     encrypted_key = encrypt_token(api_key)
@@ -414,11 +441,13 @@ def upsert_api_key(user_id, api_key):
     api_key_obj = ApiKeys.query.filter_by(user_id=user_id).first()
     if api_key_obj:
         api_key_obj.api_key_hash = hashed_key
+        api_key_obj.api_key_sha256 = api_key_sha256
         api_key_obj.api_key_encrypted = encrypted_key
     else:
         api_key_obj = ApiKeys(
             user_id=user_id, api_key_hash=hashed_key, api_key_encrypted=encrypted_key
         )
+        api_key_obj.api_key_sha256 = api_key_sha256
         db_session.add(api_key_obj)
     db_session.commit()
 
@@ -476,8 +505,6 @@ def verify_api_key(provided_api_key):
     - Valid keys cached for 1hr (balances security vs performance)
     - Cache invalidated on key regeneration
     """
-    import hashlib
-
     from flask import has_request_context, request
 
     from database.traffic_db import InvalidAPIKeyTracker
@@ -502,17 +529,36 @@ def verify_api_key(provided_api_key):
         logger.debug(f"API key verified from cache for user_id: {user_id}")
         return user_id
 
-    # Step 3: Cache miss - perform expensive Argon2 verification
+    # Step 3: Cache miss - try a deterministic lookup first, then verify one hash
     peppered_key = provided_api_key + PEPPER
     try:
-        # Query all API keys
-        api_keys = ApiKeys.query.all()
+        api_key_obj = ApiKeys.query.filter_by(api_key_sha256=cache_key).first()
+        if api_key_obj:
+            try:
+                ph.verify(api_key_obj.api_key_hash, peppered_key)
+                if not api_key_obj.api_key_sha256:
+                    api_key_obj.api_key_sha256 = cache_key
+                    db_session.commit()
+                verified_api_key_cache[cache_key] = api_key_obj.user_id
+                set_cached_api_key(cache_key, {"user_id": api_key_obj.user_id})
+                logger.debug(f"API key verified and cached for user_id: {api_key_obj.user_id}")
+                return api_key_obj.user_id
+            except VerifyMismatchError:
+                invalid_api_key_cache[cache_key] = True
+                logger.debug("Invalid API key cached after deterministic lookup")
+                return None
 
-        # Try to verify against each stored hash
+        # Legacy fallback: scan all keys once for old rows without api_key_sha256
+        api_keys = ApiKeys.query.all()
         for api_key_obj in api_keys:
             try:
                 ph.verify(api_key_obj.api_key_hash, peppered_key)
-                # Valid key found - cache it
+                if not api_key_obj.api_key_sha256:
+                    api_key_obj.api_key_sha256 = cache_key
+                    try:
+                        db_session.commit()
+                    except Exception:
+                        db_session.rollback()
                 verified_api_key_cache[cache_key] = api_key_obj.user_id
                 set_cached_api_key(cache_key, {"user_id": api_key_obj.user_id})
                 logger.debug(f"API key verified and cached for user_id: {api_key_obj.user_id}")
@@ -564,7 +610,7 @@ def get_broker_name(provided_api_key):
 
     if user_id:
         try:
-            auth_obj = Auth.query.filter_by(name=user_id).first()
+            auth_obj = Auth.query.filter_by(name=user_id, is_revoked=False).first()
             if auth_obj and not auth_obj.is_revoked:
                 # Cache the broker name
                 broker_cache[provided_api_key] = auth_obj.broker
@@ -599,7 +645,7 @@ def get_auth_token_broker(provided_api_key, include_feed_token=False):
         user_id = verify_api_key(provided_api_key)
         if user_id:
             try:
-                auth_obj = Auth.query.filter_by(name=user_id).first()
+                auth_obj = Auth.query.filter_by(name=user_id, is_revoked=False).first()
                 if auth_obj and auth_obj.is_revoked:
                     # Token was revoked, remove from cache
                     del auth_cache[cache_key]
@@ -618,7 +664,7 @@ def get_auth_token_broker(provided_api_key, include_feed_token=False):
 
     if user_id:
         try:
-            auth_obj = Auth.query.filter_by(name=user_id).first()
+            auth_obj = Auth.query.filter_by(name=user_id, is_revoked=False).first()
             if auth_obj and not auth_obj.is_revoked:
                 decrypted_token = decrypt_token(auth_obj.auth)
                 if include_feed_token:

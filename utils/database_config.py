@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import threading
+import uuid
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import psycopg2
@@ -33,41 +36,216 @@ POOL_CONFIG = {
     "pool_recycle": 1800,
     "pool_pre_ping": True,
 }
-SMALL_POOL_CONFIG = {
-    "pool_size": 2,
-    "max_overflow": 3,
-    "pool_timeout": 5,
-    "pool_recycle": 1800,
-    "pool_pre_ping": True,
-}
-SANDBOX_POOL_CONFIG = {
-    "pool_size": 3,
-    "max_overflow": 5,
-    "pool_timeout": 10,
-    "pool_recycle": 1800,
-    "pool_pre_ping": True,
-}
+SMALL_POOL_CONFIG = dict(POOL_CONFIG)
+SANDBOX_POOL_CONFIG = dict(POOL_CONFIG)
 
 _ENGINE_CACHE: dict[tuple[str, tuple[tuple[str, object], ...]], object] = {}
 _ENGINE_CACHE_LOCK = threading.Lock()
 
 
+class _FlaskGProxy:
+    """Fallback object used outside Flask request contexts."""
+
+    request_id = "no-req"
+
+
+def flask_g_safe():
+    """Return ``flask.g`` when available, otherwise a harmless fallback object."""
+    try:
+        from flask import g, has_request_context
+
+        if has_request_context():
+            return g
+    except Exception:
+        pass
+    return _FlaskGProxy()
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _sqlite_fallback_url(db_name: str) -> str:
+    db_dir = _project_root() / "db"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{(db_dir / f'{db_name}.db').as_posix()}"
+
+
+def _normalize_pool_config(pool_config: dict[str, object] | None) -> dict[str, object]:
+    effective = dict(POOL_CONFIG)
+    if pool_config:
+        effective.update(pool_config)
+    return effective
+
+
 def _cap_pool_config(pool_config: dict[str, object]) -> dict[str, object]:
-    """Cap aggressive pool settings in production to avoid exhausting remote DBs."""
+    """Normalize pool settings to the production-safe baseline."""
     capped = dict(pool_config)
 
-    if get_runtime_environment() == "production":
-        pool_size_cap = int(os.getenv("DB_POOL_SIZE_CAP", "10"))
-        overflow_cap = int(os.getenv("DB_MAX_OVERFLOW_CAP", "5"))
-        timeout_floor = int(os.getenv("DB_POOL_TIMEOUT_FLOOR", "5"))
-
-        capped["pool_size"] = min(int(capped.get("pool_size", POOL_CONFIG["pool_size"])), pool_size_cap)
-        capped["max_overflow"] = min(
-            int(capped.get("max_overflow", POOL_CONFIG["max_overflow"])), overflow_cap
-        )
-        capped["pool_timeout"] = max(int(capped.get("pool_timeout", POOL_CONFIG["pool_timeout"])), timeout_floor)
+    capped["pool_size"] = max(int(capped.get("pool_size", POOL_CONFIG["pool_size"])), POOL_CONFIG["pool_size"])
+    capped["max_overflow"] = max(
+        int(capped.get("max_overflow", POOL_CONFIG["max_overflow"])),
+        POOL_CONFIG["max_overflow"],
+    )
+    capped["pool_timeout"] = max(
+        int(capped.get("pool_timeout", POOL_CONFIG["pool_timeout"])),
+        POOL_CONFIG["pool_timeout"],
+    )
+    capped["pool_recycle"] = max(
+        int(capped.get("pool_recycle", POOL_CONFIG["pool_recycle"])),
+        POOL_CONFIG["pool_recycle"],
+    )
+    capped["pool_pre_ping"] = bool(capped.get("pool_pre_ping", POOL_CONFIG["pool_pre_ping"]))
 
     return capped
+
+
+def _db_name_from_env_var(env_var_name: str) -> str:
+    if env_var_name == "DATABASE_URL":
+        return "openalgo"
+    if env_var_name.endswith("_DATABASE_URL"):
+        return env_var_name.removesuffix("_DATABASE_URL").lower()
+    return env_var_name.lower()
+
+
+def _build_engine(
+    database_url: str,
+    *,
+    db_name: str,
+    echo: bool = False,
+    pool_config: dict[str, object] | None = None,
+):
+    if not database_url:
+        database_url = _sqlite_fallback_url(db_name)
+
+    parsed_url = make_url(database_url)
+    is_postgres = parsed_url.get_backend_name() == "postgresql"
+    is_local_host = (parsed_url.host or "").lower() in {"localhost", "127.0.0.1", "::1"}
+    is_neon = "neon.tech" in (parsed_url.host or "")
+
+    if is_postgres and not is_local_host and "sslmode=" not in database_url:
+        separator = "&" if "?" in database_url else "?"
+        database_url = f"{database_url}{separator}sslmode=require"
+
+    if is_postgres:
+        effective_pool_config = _cap_pool_config(_normalize_pool_config(pool_config))
+
+        # --- Neon serverless optimizations ---
+        # Neon has a built-in connection pooler (Neon Proxy / PgBouncer) on the
+        # "-pooler." hostname. We still keep a small SQLAlchemy pool so the app
+        # can handle concurrent work, but avoid aggressive over-sizing.
+        if is_neon:
+            effective_pool_config["pool_pre_ping"] = True
+            # Neon suspends compute after inactivity; recycle well before that.
+            effective_pool_config["pool_recycle"] = min(
+                int(effective_pool_config.get("pool_recycle", POOL_CONFIG["pool_recycle"])),
+                1800,
+            )
+            effective_pool_config["pool_timeout"] = max(
+                int(effective_pool_config.get("pool_timeout", POOL_CONFIG["pool_timeout"])),
+                30,
+            )
+            logger.debug(f"[Neon] Applying serverless pool config for db={db_name}")
+
+        # Build connect_args with Neon-appropriate values
+        connect_args: dict[str, object] = {
+            # Neon cold start can take up to 3 s; give it extra headroom.
+            "connect_timeout": 15 if is_neon else 5,
+            # Enable TCP keepalives so the OS detects half-open connections
+            # before SQLAlchemy's pool_pre_ping fires.
+            "keepalives": 1,
+            "keepalives_idle": 60,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        }
+        if is_neon:
+            # Enforce sslmode in connect_args as well (belt-and-suspenders).
+            connect_args["sslmode"] = "require"
+            # NOTE: Do NOT set connect_args["options"] with -c parameters here.
+            # Neon's built-in PgBouncer pooler REJECTS startup parameters like
+            # statement_timeout passed via the `options` DSN key and returns:
+            #   "unsupported startup parameter in options: statement_timeout"
+            # Instead, statement_timeout is set POST-connection in the
+            # _set_ist_timezone event listener below (SET statement_timeout TO 8000),
+            # which is the correct approach for pooled connections.
+
+        engine = create_engine(
+            database_url,
+            echo=echo,
+            connect_args=connect_args,
+            **effective_pool_config,
+        )
+    else:
+        # SQLite fallback for local development and tests.
+        engine = create_engine(
+            database_url,
+            echo=echo,
+            connect_args={"check_same_thread": False},
+        )
+
+    engine._openalgo_db_name = db_name  # type: ignore[attr-defined]
+
+    def _set_ist_timezone(dbapi_connection, connection_record) -> None:  # noqa: ARG001
+        if not is_postgres:
+            return
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("SET TIME ZONE 'Asia/Kolkata'")
+            cursor.execute("SET statement_timeout TO 8000")
+            cursor.close()
+        except Exception:
+            logger.debug("Could not set PostgreSQL session timezone to Asia/Kolkata")
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def before_cursor_execute(
+        conn, cursor, statement, parameters, context, executemany  # noqa: ARG001
+    ):
+        conn.info["query_start"] = time.perf_counter()
+        conn.info["query_sql"] = (statement or "")[:120]
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def after_cursor_execute(
+        conn, cursor, statement, parameters, context, executemany  # noqa: ARG001
+    ):
+        started = conn.info.get("query_start")
+        if started is None:
+            return
+        elapsed = (time.perf_counter() - started) * 1000
+        req_id = getattr(flask_g_safe(), "request_id", "no-req")
+        sql = conn.info.get("query_sql", "")
+        logger.info(
+            f"[DB] req={req_id} | db={db_name} | elapsed={elapsed:.1f}ms | sql={sql}"
+        )
+        if elapsed > 500:
+            logger.warning(
+                f"[DB-SLOW] req={req_id} | db={db_name} | elapsed={elapsed:.1f}ms | sql={sql}"
+            )
+
+    event.listen(engine, "connect", _set_ist_timezone)
+
+    @event.listens_for(engine, "checkout")
+    def on_checkout(dbapi_connection, connection_record, connection_proxy) -> None:  # noqa: ARG001
+        pool = engine.pool
+        checked_out = int(pool.checkedout()) if hasattr(pool, "checkedout") else 0
+        checked_in = int(pool.checkedin()) if hasattr(pool, "checkedin") else 0
+        overflow = int(pool.overflow()) if hasattr(pool, "overflow") else 0
+        logger.debug(
+            f"[DB-POOL] checkout db={db_name} checked_out={checked_out} "
+            f"checked_in={checked_in} overflow={overflow}"
+        )
+
+    @event.listens_for(engine, "checkin")
+    def on_checkin(dbapi_connection, connection_record) -> None:  # noqa: ARG001
+        pool = engine.pool
+        checked_out = int(pool.checkedout()) if hasattr(pool, "checkedout") else 0
+        checked_in = int(pool.checkedin()) if hasattr(pool, "checkedin") else 0
+        overflow = int(pool.overflow()) if hasattr(pool, "overflow") else 0
+        logger.debug(
+            f"[DB-POOL] checkin db={db_name} checked_out={checked_out} "
+            f"checked_in={checked_in} overflow={overflow}"
+        )
+
+    return engine
 
 
 def get_runtime_environment() -> str:
@@ -192,11 +370,12 @@ def create_engine_from_env(
     default_prefix: str = "DB",
     fallback_url: str | None = None,
     echo: bool = False,
-    pool_size: int = 50,
-    max_overflow: int = 100,
-    pool_timeout: int = 10,
-    pool_recycle: int = 3600,
+    pool_size: int = 10,
+    max_overflow: int = 20,
+    pool_timeout: int = 30,
+    pool_recycle: int = 1800,
     pool_config: dict[str, object] | None = None,
+    db_name: str | None = None,
 ):
     """Create a SQLAlchemy engine using profile-aware database selection."""
     database_url = resolve_database_url(
@@ -204,33 +383,14 @@ def create_engine_from_env(
         default_prefix=default_prefix,
         fallback_url=fallback_url,
     )
-
-    if not database_url:
-        raise RuntimeError(
-            f"Could not resolve a database URL for {env_var_name}. "
-            f"Set {env_var_name} directly or provide {get_runtime_environment().upper()}_{default_prefix}_* profile values."
-        )
-
-    if not database_url.startswith("postgresql"):
-        raise RuntimeError(
-            f"Runtime database access must use PostgreSQL. "
-            f"Set {env_var_name} or the {get_runtime_environment().upper()} profile to PostgreSQL."
-        )
-
-    effective_pool_config = pool_config
-    if effective_pool_config is None:
-        if env_var_name in {"LOGS_DATABASE_URL", "LATENCY_DATABASE_URL", "HEALTH_DATABASE_URL"} or default_prefix in {
-            "LOGS_DB",
-            "LATENCY_DB",
-            "HEALTH_DB",
-        }:
-            effective_pool_config = SMALL_POOL_CONFIG
-        else:
-            effective_pool_config = POOL_CONFIG
-
-    effective_pool_config = _cap_pool_config(dict(effective_pool_config))
-
-    return get_engine(database_url, echo=echo, pool_config=effective_pool_config)
+    effective_db_name = db_name or _db_name_from_env_var(env_var_name)
+    effective_pool_config = _normalize_pool_config(pool_config)
+    return get_engine(
+        database_url or _sqlite_fallback_url(effective_db_name),
+        echo=echo,
+        pool_config=effective_pool_config,
+        db_name=effective_db_name,
+    )
 
 
 def get_engine(
@@ -238,18 +398,14 @@ def get_engine(
     *,
     echo: bool = False,
     pool_config: dict[str, object] | None = None,
+    db_name: str = "openalgo",
 ):
     """Return a shared SQLAlchemy engine for the given PostgreSQL URL."""
     if not database_url:
-        raise RuntimeError("Cannot create a database engine from an empty URL.")
+        database_url = _sqlite_fallback_url(db_name)
 
-    effective_pool_config = dict(POOL_CONFIG)
-    if pool_config:
-        effective_pool_config.update(pool_config)
-
-    effective_pool_config = _cap_pool_config(effective_pool_config)
-
-    cache_key = (database_url, tuple(sorted(effective_pool_config.items())))
+    effective_pool_config = _normalize_pool_config(pool_config)
+    cache_key = (database_url, db_name, tuple(sorted(effective_pool_config.items())))
 
     cached = _ENGINE_CACHE.get(cache_key)
     if cached is not None:
@@ -259,42 +415,42 @@ def get_engine(
         cached = _ENGINE_CACHE.get(cache_key)
         if cached is not None:
             return cached
-
-        engine = create_engine(
+        engine = _build_engine(
             database_url,
+            db_name=db_name,
             echo=echo,
-            **effective_pool_config,
+            pool_config=effective_pool_config,
         )
-
-        def _set_ist_timezone(dbapi_connection, connection_record) -> None:  # noqa: ARG001
-            try:
-                cursor = dbapi_connection.cursor()
-                cursor.execute("SET TIME ZONE 'Asia/Kolkata'")
-                cursor.close()
-            except Exception:
-                logger.debug("Could not set PostgreSQL session timezone to Asia/Kolkata")
-
-        event.listen(engine, "connect", _set_ist_timezone)
         _ENGINE_CACHE[cache_key] = engine
         return engine
 
 
 def get_resolved_database_urls() -> dict[str, str]:
     """Return the resolved runtime URLs for all PostgreSQL-backed databases."""
-    main_url = resolve_database_url("DATABASE_URL", default_prefix="DB")
+    main_url = resolve_database_url("DATABASE_URL", default_prefix="DB") or _sqlite_fallback_url(
+        "openalgo"
+    )
     return {
         "DATABASE_URL": main_url,
         "LATENCY_DATABASE_URL": resolve_database_url(
-            "LATENCY_DATABASE_URL", default_prefix="LATENCY_DB", fallback_url=main_url
+            "LATENCY_DATABASE_URL",
+            default_prefix="LATENCY_DB",
+            fallback_url=main_url if main_url.startswith("postgresql") else _sqlite_fallback_url("latency"),
         ),
         "LOGS_DATABASE_URL": resolve_database_url(
-            "LOGS_DATABASE_URL", default_prefix="LOGS_DB", fallback_url=main_url
+            "LOGS_DATABASE_URL",
+            default_prefix="LOGS_DB",
+            fallback_url=main_url if main_url.startswith("postgresql") else _sqlite_fallback_url("logs"),
         ),
         "SANDBOX_DATABASE_URL": resolve_database_url(
-            "SANDBOX_DATABASE_URL", default_prefix="SANDBOX_DB", fallback_url=main_url
+            "SANDBOX_DATABASE_URL",
+            default_prefix="SANDBOX_DB",
+            fallback_url=main_url if main_url.startswith("postgresql") else _sqlite_fallback_url("sandbox"),
         ),
         "HEALTH_DATABASE_URL": resolve_database_url(
-            "HEALTH_DATABASE_URL", default_prefix="HEALTH_DB", fallback_url=main_url
+            "HEALTH_DATABASE_URL",
+            default_prefix="HEALTH_DB",
+            fallback_url=main_url if main_url.startswith("postgresql") else _sqlite_fallback_url("health"),
         ),
     }
 
@@ -431,13 +587,12 @@ def get_pool_status() -> dict[str, dict[str, object]]:
     """Return live SQLAlchemy pool stats for all resolved runtime engines."""
     resolved_urls = get_resolved_database_urls()
     status: dict[str, dict[str, object]] = {}
-    warn_threshold = POOL_CONFIG["pool_size"] + int(POOL_CONFIG["max_overflow"] * 0.8)
 
     for env_var, database_url in resolved_urls.items():
         if not database_url or not database_url.startswith("postgresql"):
             continue
 
-        engine = get_engine(database_url)
+        engine = get_engine(database_url, db_name=_db_name_from_env_var(env_var))
         pool = engine.pool
 
         checked_out = int(pool.checkedout()) if hasattr(pool, "checkedout") else 0
@@ -509,25 +664,40 @@ def bulk_insert_mappings_chunked(
         if env_chunk_size:
             effective_chunk_size = max(1, int(env_chunk_size))
         else:
-            effective_chunk_size = max(chunk_size, int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE_DEFAULT", "15000")))
+            effective_chunk_size = max(
+                chunk_size,
+                int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE_DEFAULT", "10000")),
+            )
 
     if logger:
         logger.info(f"Starting {label} of {total} records in chunks of {effective_chunk_size}")
 
+    total_chunks = max(1, (total + effective_chunk_size - 1) // effective_chunk_size)
+
     for start in range(0, total, effective_chunk_size):
         chunk = records[start : start + effective_chunk_size]
+        chunk_number = start // effective_chunk_size + 1
         session = session_factory()
         try:
+            if logger:
+                logger.info(
+                    f"{label} chunk {chunk_number}/{total_chunks} "
+                    f"size={len(chunk)} starting"
+                )
             session.bulk_insert_mappings(model, chunk)
             session.commit()
             inserted += len(chunk)
-            if logger and ((start // effective_chunk_size + 1) % progress_every == 0 or inserted == total):
+            if logger and (
+                label.lower().startswith("master contract")
+                or (chunk_number % progress_every == 0)
+                or inserted == total
+            ):
                 logger.info(f"Inserted {inserted}/{total} records")
         except Exception as exc:
             session.rollback()
             if logger:
                 logger.exception(
-                    f"{label} chunk insert failed at chunk {start // effective_chunk_size + 1}: {exc}"
+                    f"{label} chunk insert failed at chunk {chunk_number}/{total_chunks}: {exc}"
                 )
             raise
         finally:

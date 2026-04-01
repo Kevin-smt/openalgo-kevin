@@ -10,6 +10,7 @@ from utils.event_bus import bus
 from limiter import limiter
 from restx_api.schemas import SmartOrderSchema
 from services.place_smart_order_service import emit_analyzer_error, place_smart_order
+from utils.api_timer import APITimer
 from utils.logging import get_logger
 
 SMART_ORDER_RATE_LIMIT = os.getenv("SMART_ORDER_RATE_LIMIT", "2 per second")
@@ -28,6 +29,7 @@ class SmartOrder(Resource):
     @limiter.limit(SMART_ORDER_RATE_LIMIT)
     def post(self):
         """Place a smart order"""
+        timer = APITimer("smartorder")
         try:
             data = request.json
 
@@ -37,6 +39,7 @@ class SmartOrder(Resource):
             except ValidationError as err:
                 error_message = str(err.messages)
                 if get_analyze_mode():
+                    timer.finish(status="error")
                     return make_response(jsonify(emit_analyzer_error(data, error_message)), 400)
                 error_response = {"status": "error", "message": error_message}
                 bus.publish(OrderFailedEvent(
@@ -46,22 +49,27 @@ class SmartOrder(Resource):
                     response_data=error_response,
                     error_message=error_message,
                 ))
+                timer.finish(status="error")
                 return make_response(jsonify(error_response), 400)
+            timer.checkpoint("request_validation")
 
             # Extract API key
             api_key = order_data.pop("apikey", None)
+            timer.checkpoint("auth_and_preflight_db")
 
             # Call the service function to place the smart order
             success, response_data, status_code = place_smart_order(
                 order_data=order_data, api_key=api_key, smart_order_delay=SMART_ORDER_DELAY
             )
 
+            timer.finish(status="success" if success else "error")
             return make_response(jsonify(response_data), status_code)
 
         except Exception:
             logger.exception("An unexpected error occurred in SmartOrder endpoint.")
             error_message = "An unexpected error occurred"
             if get_analyze_mode():
+                timer.finish(status="error")
                 return make_response(jsonify(emit_analyzer_error(data, error_message)), 500)
             error_response = {"status": "error", "message": error_message}
             bus.publish(OrderFailedEvent(
@@ -71,4 +79,5 @@ class SmartOrder(Resource):
                 response_data=error_response,
                 error_message=error_message,
             ))
+            timer.finish(status="error")
             return make_response(jsonify(error_response), 500)

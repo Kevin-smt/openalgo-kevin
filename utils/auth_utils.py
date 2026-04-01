@@ -281,6 +281,11 @@ def async_master_contract_download(broker):
     try:
         master_contract_status = master_contract_module.master_contract_download()
 
+        if isinstance(master_contract_status, dict) and master_contract_status.get("status") == "error":
+            raise RuntimeError(
+                master_contract_status.get("message", "Master contract download failed")
+            )
+
         # Most brokers return the socketio.emit result, we need to check completion
         # by looking at the module's actual completion
 

@@ -1,9 +1,12 @@
 # database/sandbox_db.py
 
 import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 from dotenv import load_dotenv
+from cachetools import TTLCache
 from sqlalchemy import (
     DECIMAL,
     Boolean,
@@ -17,7 +20,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from database.db import Base, Session, engine
+from database.db import Base, Session, SessionLocal, engine
 from utils.logging import get_logger
 from utils.timezone import now_ist
 
@@ -32,6 +35,39 @@ load_dotenv()
 SANDBOX_DATABASE_URL = os.getenv("SANDBOX_DATABASE_URL", "")
 logger.info(f"[LEDGER DEBUG] Sandbox DB engine URL: {engine.url}")
 db_session = Session
+
+_config_cache = TTLCache(
+    maxsize=128, ttl=int(os.getenv("SANDBOX_CONFIG_CACHE_TTL", "30"))
+)
+_config_cache_lock = threading.Lock()
+
+
+@contextmanager
+def _session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _invalidate_config_cache():
+    with _config_cache_lock:
+        _config_cache.clear()
+
+
+def _get_cached_config(config_key):
+    with _config_cache_lock:
+        return _config_cache.get(config_key)
+
+
+def _set_cached_config(config_key, value):
+    with _config_cache_lock:
+        _config_cache[config_key] = value
 
 
 class SandboxOrders(Base):
@@ -367,32 +403,41 @@ def init_default_config():
         },
     ]
 
-    for config in default_configs:
-        try:
-            existing = SandboxConfig.query.filter_by(config_key=config["config_key"]).first()
-            if not existing:
-                config_obj = SandboxConfig(**config)
-                db_session.add(config_obj)
-                db_session.commit()
-                logger.debug(f"Added default config: {config['config_key']}")
-        except IntegrityError:
-            db_session.rollback()
-            logger.debug(f"Config already exists: {config['config_key']}")
-        except Exception as e:
-            db_session.rollback()
-            logger.exception(f"Error adding config {config['config_key']}: {e}")
-    db_session.remove()
+    try:
+        with _session_scope() as session:
+            existing_keys = {
+                row[0]
+                for row in session.query(SandboxConfig.config_key)
+                .filter(SandboxConfig.config_key.in_([cfg["config_key"] for cfg in default_configs]))
+                .all()
+            }
+
+            missing = [SandboxConfig(**cfg) for cfg in default_configs if cfg["config_key"] not in existing_keys]
+            if missing:
+                session.add_all(missing)
+                logger.debug(f"Added {len(missing)} default sandbox config row(s)")
+    except IntegrityError:
+        logger.debug("Sandbox config defaults already exist")
+    except Exception as e:
+        logger.exception(f"Error initializing sandbox defaults: {e}")
+    finally:
+        _invalidate_config_cache()
 
 
 def get_config(config_key, default=None):
     """Get configuration value by key"""
     try:
-        config = SandboxConfig.query.filter_by(config_key=config_key).first()
-        if config:
-            return config.config_value
-        return default
+        cached = _get_cached_config(config_key)
+        if cached is not None:
+            return cached
+
+        with SessionLocal() as session:
+            config = session.query(SandboxConfig).filter_by(config_key=config_key).first()
+            if config:
+                _set_cached_config(config_key, config.config_value)
+                return config.config_value
+            return default
     except Exception as e:
-        db_session.rollback()
         logger.exception(f"Error fetching config {config_key}: {e}")
         return default
 
@@ -400,21 +445,21 @@ def get_config(config_key, default=None):
 def set_config(config_key, config_value, description=None):
     """Set configuration value"""
     try:
-        config = SandboxConfig.query.filter_by(config_key=config_key).first()
-        if config:
-            config.config_value = str(config_value)
-            if description:
-                config.description = description
-        else:
-            config = SandboxConfig(
-                config_key=config_key, config_value=str(config_value), description=description
-            )
-            db_session.add(config)
-        db_session.commit()
+        with _session_scope() as session:
+            config = session.query(SandboxConfig).filter_by(config_key=config_key).first()
+            if config:
+                config.config_value = str(config_value)
+                if description:
+                    config.description = description
+            else:
+                config = SandboxConfig(
+                    config_key=config_key, config_value=str(config_value), description=description
+                )
+                session.add(config)
         logger.info(f"Updated config: {config_key} = {config_value}")
+        _set_cached_config(config_key, str(config_value))
         return True
     except Exception as e:
-        db_session.rollback()
         logger.exception(f"Error setting config {config_key}: {e}")
         return False
 
@@ -422,11 +467,16 @@ def set_config(config_key, config_value, description=None):
 def get_all_configs():
     """Get all configuration values"""
     try:
-        configs = SandboxConfig.query.all()
-        return {
-            config.config_key: {"value": config.config_value, "description": config.description}
-            for config in configs
-        }
+        with SessionLocal() as session:
+            configs = session.query(SandboxConfig).all()
+            result = {
+                config.config_key: {"value": config.config_value, "description": config.description}
+                for config in configs
+            }
+        with _config_cache_lock:
+            for key, value in result.items():
+                _config_cache[key] = value["value"]
+        return result
     except Exception as e:
         logger.exception(f"Error fetching all configs: {e}")
         return {}
