@@ -58,7 +58,7 @@ class PlaceOrder(Resource):
 
                 timer.checkpoint("dedup_check_db")
                 success, response_data, status_code = queue_order(
-                    api_key, order_data, "placeorder"
+                    api_key, order_data, "placeorder", user_id=preflight["user_id"]
                 )
                 timer.finish(status="success" if success else "error")
                 return make_response(jsonify(response_data), status_code)

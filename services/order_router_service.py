@@ -73,7 +73,10 @@ def should_route_to_pending(api_key: str, api_type: str | None = None) -> bool:
 
 
 def queue_order(
-    api_key: str, order_data: dict[str, Any], api_type: str
+    api_key: str,
+    order_data: dict[str, Any],
+    api_type: str,
+    user_id: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Queue an order to the Action Center (pending_orders table)
@@ -91,7 +94,8 @@ def queue_order(
     """
     try:
         # Verify API key and get user ID
-        user_id = verify_api_key(api_key)
+        if not user_id:
+            user_id = verify_api_key(api_key)
         if not user_id:
             logger.warning("Invalid API key for queuing order")
             return False, {"status": "error", "message": "Invalid API key"}, 403

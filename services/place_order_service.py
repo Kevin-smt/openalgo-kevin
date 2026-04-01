@@ -1,6 +1,7 @@
 import copy
 import importlib
 import traceback
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -24,12 +25,22 @@ from utils.constants import (
 )
 from utils.event_bus import bus
 from utils.logging import get_logger
+from extensions import socketio
 
 # Initialize logger
 logger = get_logger(__name__)
 
 # Initialize schema
 order_schema = OrderSchema()
+
+
+def _log_timing(label: str, started_at: float, **fields: Any) -> None:
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    extras = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    if extras:
+        logger.info(f"[TIMING] place_order | stage={label} | elapsed_ms={elapsed_ms} | {extras}")
+    else:
+        logger.info(f"[TIMING] place_order | stage={label} | elapsed_ms={elapsed_ms}")
 
 
 def import_broker_module(broker_name: str) -> Any | None:
@@ -149,6 +160,7 @@ def place_order_with_auth(
         - Response data (dict)
         - HTTP status code (int)
     """
+    request_started_at = time.perf_counter()
     order_request_data = copy.deepcopy(original_data)
     if "apikey" in order_request_data:
         order_request_data.pop("apikey", None)
@@ -162,12 +174,16 @@ def place_order_with_auth(
         bool(api_key),
     )
 
+    _log_timing("service_enter", request_started_at, broker=broker, symbol=order_data.get("symbol"))
+
     if timer:
         timer.checkpoint("symbol_lookup_db")
 
     # If in analyze mode, route to sandbox for virtual trading
     if analyze_mode is None:
         analyze_mode = get_analyze_mode()
+
+    _log_timing("analyze_mode_resolved", request_started_at, analyze_mode=analyze_mode)
 
     if analyze_mode:
         from services.sandbox_service import sandbox_place_order
@@ -181,6 +197,7 @@ def place_order_with_auth(
             return False, error_response, 400
 
         success, response, status_code = sandbox_place_order(order_data, api_key, original_data)
+        _log_timing("sandbox_place_order", request_started_at, success=success, status_code=status_code)
 
         if emit_event:
             bus.publish(OrderPlacedEvent(
@@ -220,7 +237,15 @@ def place_order_with_auth(
     try:
         if timer:
             timer.checkpoint("broker_api_call")
+        broker_call_started_at = time.perf_counter()
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
+        _log_timing(
+            "broker_api_call_complete",
+            broker_call_started_at,
+            broker=broker,
+            symbol=order_data.get("symbol"),
+            status=getattr(res, "status", None),
+        )
     except Exception as e:
         logger.error(f"Error in broker_module.place_order_api: {e}")
         traceback.print_exc()
@@ -274,6 +299,7 @@ def place_order_with_auth(
         )
         if timer:
             timer.checkpoint("order_write_db")
+        mirror_started_at = time.perf_counter()
         mirrored = mirror_live_order(
             order_data=order_data,
             broker=broker,
@@ -288,13 +314,25 @@ def place_order_with_auth(
             logger.warning("[LEDGER DEBUG] mirror_live_order did not persist the order")
         else:
             logger.info("[LEDGER DEBUG] mirror_live_order completed successfully")
+        _log_timing(
+            "mirror_live_order_complete",
+            mirror_started_at,
+            broker=broker,
+            symbol=order_data.get("symbol"),
+            mirrored=mirrored,
+        )
 
-        # Immediately refresh mirrored live-trading state so trades/positions/holdings
-        # are persisted right after a successful broker execution.
+        # Refresh mirrored live-trading state asynchronously so the order response
+        # is not blocked by orderbook/tradebook/positions/holdings reconciliation.
         try:
             from services.trading_sync_service import sync_live_trading_state
 
-            sync_live_trading_state(api_key, reason="placeorder")
+            _log_timing("background_sync_queued", request_started_at, api_key_present=bool(api_key))
+            socketio.start_background_task(
+                sync_live_trading_state,
+                api_key,
+                "placeorder",
+            )
         except Exception as exc:
             logger.warning(f"[LEDGER DEBUG] live trading sync after placeorder failed: {exc}")
 
@@ -346,6 +384,13 @@ def place_order_with_auth(
             logger.warning("[LEDGER DEBUG] mirror_live_order did not persist the rejected order")
         else:
             logger.info("[LEDGER DEBUG] mirror_live_order completed successfully")
+        _log_timing(
+            "rejected_order_mirrored",
+            request_started_at,
+            broker=broker,
+            symbol=order_data.get("symbol"),
+            mirrored=mirrored,
+        )
         return False, error_response, res.status if res.status != 200 else 500
 
 
