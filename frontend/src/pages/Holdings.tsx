@@ -28,6 +28,7 @@ import { usePageVisibility } from '@/hooks/usePageVisibility'
 import { cn, makeFormatCurrency, sanitizeCSV } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 import { onModeChange } from '@/stores/themeStore'
+import { todayIstIsoDate } from '@/utils/time'
 import type { Holding, HoldingsStats } from '@/types/trading'
 import { showToast } from '@/utils/toast'
 
@@ -184,7 +185,7 @@ export default function Holdings() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      const filename = `holdings_${new Date().toISOString().split('T')[0]}.csv`
+      const filename = `holdings_${todayIstIsoDate()}.csv`
       a.download = filename
       a.click()
       // Revoke the object URL to free memory

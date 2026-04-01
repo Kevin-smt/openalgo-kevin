@@ -6,6 +6,7 @@ from database.apilog_db import async_log_order
 from database.apilog_db import executor as log_executor
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
+from database.trading_db import _resolve_ledger_user_id, save_trade, update_order_status
 from extensions import socketio
 from services.tradebook_service import get_tradebook
 from utils.logging import get_logger
@@ -45,7 +46,11 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
 
 
 def get_order_status_with_auth(
-    status_data: dict[str, Any], auth_token: str, broker: str, original_data: dict[str, Any]
+    status_data: dict[str, Any],
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any],
+    user_id: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get status of a specific order using provided auth token.
@@ -206,6 +211,26 @@ def get_order_status_with_auth(
                 trades_list = tradebook_response.get("data", [])
                 logger.debug(f"[OrderStatus] Tradebook returned {len(trades_list)} trades")
 
+                try:
+                    api_key = original_data.get("apikey") if original_data else None
+                    ledger_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
+
+                    if ledger_user_id:
+                        for trade in trades_list:
+                            trade_payload = trade.copy()
+                            trade_payload["user_id"] = ledger_user_id
+                            trade_payload["broker"] = broker
+                            trade_payload["api_key"] = api_key
+                            trade_payload["broker_order_id"] = trade.get("orderid") or trade.get(
+                                "order_id"
+                            )
+                            trade_payload["broker_trade_id"] = trade.get("tradeid") or trade.get(
+                                "trade_id"
+                            )
+                            save_trade(trade_payload)
+                except Exception as exc:
+                    logger.warning(f"Trade mirror sync from orderstatus failed: {exc}")
+
                 # Find matching trade by orderid and get average_price
                 logger.info(
                     f"[OrderStatus] Searching for OrderID {orderid} in {len(trades_list)} trades"
@@ -244,6 +269,26 @@ def get_order_status_with_auth(
     # Add average_price to the order data
     order_found["average_price"] = average_price
     logger.debug(f"[OrderStatus] Final average_price set to: {average_price}")
+
+    try:
+        api_key = original_data.get("apikey") if original_data else None
+        ledger_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
+
+        if ledger_user_id:
+            update_order_status(
+                broker_order_id=str(order_found.get("orderid") or order_found.get("order_id")),
+                status=order_found.get("order_status", ""),
+                filled_qty=order_found.get("filled_quantity")
+                or order_found.get("filledqty")
+                or order_found.get("traded_quantity")
+                or order_found.get("tradedqty"),
+                avg_price=order_found.get("average_price") or average_price,
+                rejection_reason=order_found.get("rejection_reason"),
+                broker=broker,
+                user_id=ledger_user_id,
+            )
+    except Exception as exc:
+        logger.warning(f"Order status mirror sync failed (non-critical): {exc}")
 
     # Prepare response data
     response_data = {"status": "success", "data": order_found}
@@ -288,6 +333,7 @@ def get_order_status(
     api_key: str | None = None,
     auth_token: str | None = None,
     broker: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get status of a specific order.
@@ -320,11 +366,15 @@ def get_order_status(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        return get_order_status_with_auth(status_data, AUTH_TOKEN, broker_name, original_data)
+        return get_order_status_with_auth(
+            status_data, AUTH_TOKEN, broker_name, original_data, user_id=user_id
+        )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return get_order_status_with_auth(status_data, auth_token, broker, original_data)
+        return get_order_status_with_auth(
+            status_data, auth_token, broker, original_data, user_id=user_id
+        )
 
     # Case 3: Invalid parameters
     else:

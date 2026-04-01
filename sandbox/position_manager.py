@@ -28,6 +28,7 @@ from sandbox.holdings_manager import HoldingsManager
 from services.market_data_service import get_market_data_service
 from services.quotes_service import get_multiquotes, get_quotes
 from utils.logging import get_logger
+from utils.timezone import IST, ensure_ist, now_ist
 
 logger = get_logger(__name__)
 
@@ -335,7 +336,7 @@ class PositionManager:
         if expiry_date:
             from sqlalchemy import text
 
-            hide_date = datetime.combine(expiry_date, datetime.min.time())
+            hide_date = datetime.combine(expiry_date, datetime.min.time(), tzinfo=IST)
             db_session.execute(
                 text("UPDATE sandbox_positions SET updated_at = :hide_date WHERE id = :pos_id"),
                 {"hide_date": hide_date, "pos_id": position.id},
@@ -364,8 +365,8 @@ class PositionManager:
             session_expiry_str = os.getenv("SESSION_EXPIRY_TIME", "03:00")
             expiry_hour, expiry_minute = map(int, session_expiry_str.split(":"))
 
-            # Get current time
-            now = datetime.now()
+            # Normalize all comparisons to aware IST datetimes.
+            now = now_ist()
             today = now.date()
 
             # Calculate if we're in a new session
@@ -376,12 +377,12 @@ class PositionManager:
                 # We're before today's session expiry (e.g., before 3 AM)
                 # Last session expired yesterday at 3 AM
                 last_session_expiry = datetime.combine(
-                    today - timedelta(days=1), session_expiry_time
+                    today - timedelta(days=1), session_expiry_time, tzinfo=IST
                 )
             else:
                 # We're after today's session expiry (e.g., after 3 AM)
                 # Last session expired today at 3 AM
-                last_session_expiry = datetime.combine(today, session_expiry_time)
+                last_session_expiry = datetime.combine(today, session_expiry_time, tzinfo=IST)
 
             # Get all positions (including zero quantity ones from current session)
             positions_query = SandboxPositions.query.filter(
@@ -402,7 +403,8 @@ class PositionManager:
                 if position.today_realized_pnl and position.today_realized_pnl != 0:
                     # Check if there's been a session boundary since the position was created/traded
                     # If position was last modified before today's session boundary, reset today_realized_pnl
-                    position_date = position.updated_at.date() if position.updated_at else today
+                    position_updated_at = ensure_ist(position.updated_at)
+                    position_date = position_updated_at.date() if position_updated_at else today
                     session_boundary_date = last_session_expiry.date()
 
                     # If position's date is before today's session boundary date, or
@@ -411,7 +413,8 @@ class PositionManager:
                         needs_pnl_reset = True
                     elif (
                         position_date == session_boundary_date
-                        and position.updated_at < last_session_expiry
+                        and position_updated_at
+                        and position_updated_at < last_session_expiry
                     ):
                         needs_pnl_reset = True
 
@@ -438,7 +441,8 @@ class PositionManager:
                     db_session.refresh(position)
 
                 # If position was updated after last session expiry, include it
-                if position.updated_at >= last_session_expiry:
+                position_updated_at = ensure_ist(position.updated_at)
+                if position_updated_at and position_updated_at >= last_session_expiry:
                     # For OPEN positions (qty != 0): always include
                     if position.quantity != 0:
                         positions.append(position)
@@ -966,7 +970,7 @@ class PositionManager:
             expiry_hour, expiry_minute = map(int, session_expiry_str.split(":"))
 
             # Get current time
-            now = datetime.now()
+            now = now_ist()
             today = now.date()
 
             # Calculate session start time
@@ -977,11 +981,13 @@ class PositionManager:
             if now.time() < session_expiry_time:
                 # We're in the early morning before session expiry
                 # Session started yesterday at expiry time
-                session_start = datetime.combine(today - timedelta(days=1), session_expiry_time)
+                session_start = datetime.combine(
+                    today - timedelta(days=1), session_expiry_time, tzinfo=IST
+                )
             else:
                 # We're after session expiry time
                 # Session started today at expiry time
-                session_start = datetime.combine(today, session_expiry_time)
+                session_start = datetime.combine(today, session_expiry_time, tzinfo=IST)
 
             trades = (
                 SandboxTrades.query.filter(
@@ -1214,13 +1220,12 @@ def cleanup_expired_contracts():
     - P&L calculated and added to realized P&L
     - Position quantity set to 0
     """
-    from datetime import date
     from decimal import Decimal
 
     from sandbox.fund_manager import FundManager
 
     try:
-        today = date.today()
+        today = now_ist().date()
 
         # Find all open positions in F&O exchanges
         fo_exchanges = ["NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX", "CRYPTO"]
@@ -1326,7 +1331,7 @@ def cleanup_expired_contracts():
                         # This hides expired contracts from current session
                         from sqlalchemy import text
 
-                        hide_date = datetime.combine(expiry_date, datetime.min.time())
+                        hide_date = datetime.combine(expiry_date, datetime.min.time(), tzinfo=IST)
                         db_session.execute(
                             text(
                                 "UPDATE sandbox_positions SET updated_at = :hide_date WHERE id = :pos_id"
@@ -1370,9 +1375,8 @@ def catchup_missed_settlements():
         cleanup_expired_contracts()
 
         # Then handle CNC T+1 settlement
-        ist = pytz.timezone("Asia/Kolkata")
-        today = datetime.now(ist).date()
-        cutoff_time = datetime.combine(today, datetime.min.time())
+        today = now_ist().date()
+        cutoff_time = datetime.combine(today, datetime.min.time(), tzinfo=IST)
 
         cnc_positions = (
             SandboxPositions.query.filter_by(product="CNC")

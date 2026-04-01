@@ -12,6 +12,7 @@ from utils.event_bus import bus
 from limiter import limiter
 from restx_api.schemas import BasketOrderSchema
 from services.basket_order_service import emit_analyzer_error, place_basket_order
+from utils.api_timer import APITimer
 from utils.logging import get_logger
 
 API_RATE_LIMIT = os.getenv("API_RATE_LIMIT", "10 per second")
@@ -29,6 +30,7 @@ class BasketOrder(Resource):
     @limiter.limit(API_RATE_LIMIT)
     def post(self):
         """Place multiple orders in a basket"""
+        timer = APITimer("basketorder")
         try:
             data = request.json
 
@@ -38,6 +40,7 @@ class BasketOrder(Resource):
             except ValidationError as err:
                 error_message = str(err.messages)
                 if get_analyze_mode():
+                    timer.finish(status="error")
                     return make_response(jsonify(emit_analyzer_error(data, error_message)), 400)
                 error_response = {"status": "error", "message": error_message}
                 bus.publish(OrderFailedEvent(
@@ -47,16 +50,20 @@ class BasketOrder(Resource):
                     response_data=error_response,
                     error_message=error_message,
                 ))
+                timer.finish(status="error")
                 return make_response(jsonify(error_response), 400)
+            timer.checkpoint("request_validation")
 
             # Extract API key
             api_key = basket_data.pop("apikey", None)
+            timer.checkpoint("auth_and_preflight_db")
 
             # Call the service function to place the basket order
             success, response_data, status_code = place_basket_order(
                 basket_data=basket_data, api_key=api_key
             )
 
+            timer.finish(status="success" if success else "error")
             return make_response(jsonify(response_data), status_code)
 
         except Exception:
@@ -64,6 +71,7 @@ class BasketOrder(Resource):
             traceback.print_exc()
             error_message = "An unexpected error occurred"
             if get_analyze_mode():
+                timer.finish(status="error")
                 return make_response(jsonify(emit_analyzer_error(data, error_message)), 500)
             error_response = {"status": "error", "message": error_message}
             bus.publish(OrderFailedEvent(
@@ -73,4 +81,5 @@ class BasketOrder(Resource):
                 response_data=error_response,
                 error_message=error_message,
             ))
+            timer.finish(status="error")
             return make_response(jsonify(error_response), 500)

@@ -4,38 +4,27 @@ import os
 import time
 
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine, text
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
+from utils.database_config import bulk_insert_mappings_chunked, create_engine_from_env
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-# Create engine with optimized settings for SQLite concurrency
-engine = create_engine(
-    DATABASE_URL,
+engine = create_engine_from_env(
+    "DATABASE_URL",
+    default_prefix="DB",
     pool_size=20,
     max_overflow=50,
     pool_timeout=30,
     pool_recycle=3600,
-    connect_args={"timeout": 30, "check_same_thread": False},
 )
-
-# Enable WAL mode for better concurrent access
-try:
-    with engine.connect() as conn:
-        conn.execute(text("PRAGMA journal_mode=WAL"))
-        conn.execute(text("PRAGMA synchronous=NORMAL"))
-        conn.execute(text("PRAGMA temp_store=memory"))
-        conn.execute(text("PRAGMA mmap_size=268435456"))  # 256MB
-        conn.commit()
-except Exception as e:
-    logger.warning(f"Could not set SQLite pragmas for master_contract_db: {e}")
 
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
@@ -67,7 +56,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     # Idempotent migration: add contract_value column if not already present.
     # Using Inspector (check-before-add) is more reliable than catching exceptions
-    # because the error message for "column already exists" varies across SQLite versions.
+    # because the error message for "column already exists" varies across databases.
     try:
         from sqlalchemy import inspect as sa_inspect
         insp = sa_inspect(engine)
@@ -80,7 +69,7 @@ def init_db():
     except Exception as e:
         logger.error(
             f"contract_value migration FAILED — master contract insert will fail until "
-            f"the column is added. Run: sqlite3 db/openalgo.db "
+            f"the column is added. Run the PostgreSQL migration to add the column "
             f"\"ALTER TABLE symtoken ADD COLUMN contract_value REAL DEFAULT 1.0\" | Error: {e}"
         )
 
@@ -115,65 +104,23 @@ def copy_from_dataframe(df):
 
     # Retrieve existing tokens to filter them out from the insert
     existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
     # Filter out data_dict entries with tokens that already exist
     filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in smaller chunks to minimize database lock time
-    chunk_size = 500  # Reduced chunk size for shorter lock duration
-    total_inserted = 0
-
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            logger.info(
-                f"Starting bulk insert of {len(filtered_data_dict)} records in chunks of {chunk_size}"
-            )
-
-            # Process data in chunks
-            for i in range(0, len(filtered_data_dict), chunk_size):
-                chunk = filtered_data_dict[i : i + chunk_size]
-
-                # Use a separate transaction for each chunk with retry logic
-                try:
-                    # Insert chunk
-                    db_session.bulk_insert_mappings(SymToken, chunk)
-                    db_session.commit()  # Commit each chunk immediately
-
-                    total_inserted += len(chunk)
-
-                    # Log progress every 20 chunks (10,000 records)
-                    if (i // chunk_size + 1) % 20 == 0:
-                        logger.debug(f"Processed {total_inserted} records so far...")
-
-                except Exception as chunk_error:
-                    logger.warning(
-                        f"Error inserting chunk {i // chunk_size + 1}, retrying: {chunk_error}"
-                    )
-                    db_session.rollback()
-
-                    # Retry once for this chunk
-                    try:
-                        time.sleep(0.1)  # Brief pause before retry
-                        db_session.bulk_insert_mappings(SymToken, chunk)
-                        db_session.commit()
-                        total_inserted += len(chunk)
-                    except Exception as retry_error:
-                        logger.error(
-                            f"Failed to insert chunk {i // chunk_size + 1} after retry: {retry_error}"
-                        )
-                        db_session.rollback()
-                        # Continue with next chunk instead of failing completely
-                        continue
-
-                # Small delay to allow other operations
-                time.sleep(0.005)  # 5ms delay between chunks (reduced from 10ms)
-
-            logger.info(f"Bulk insert completed successfully with {total_inserted} new records.")
-        else:
-            logger.info("No new records to insert.")
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=500,
+            logger=logger,
+            label="Delta master contract",
+        )
     except Exception as e:
         logger.exception(f"Error during bulk insert: {e}")
-        db_session.rollback()
+        raise
 
 
 def _to_canonical_symbol(delta_symbol: str, instrument_type: str, expiry: str) -> str:

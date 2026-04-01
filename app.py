@@ -7,6 +7,10 @@ import os
 import re
 import sys
 
+# Master-contract inserts should use larger batches by default to reduce round trips.
+# Individual deployments can still override this via an environment variable.
+os.environ.setdefault("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "1500")
+
 # Print startup banner EARLY (before heavy imports) so user sees immediate feedback
 if __name__ == "__main__":
     from utils.version import get_version as _get_version_early
@@ -183,7 +187,7 @@ from database.flow_db import init_db as ensure_flow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
-from database.sandbox_db import init_db as ensure_sandbox_tables_exists
+from database.sandbox_db import init_sandbox_db as ensure_sandbox_tables_exists
 from database.settings_db import init_db as ensure_settings_tables_exists
 from database.strategy_db import init_db as ensure_strategy_tables_exists
 from database.symbol import init_db as ensure_master_contract_tables_exists
@@ -203,6 +207,7 @@ from utils.logging import (  # Import centralized logging
 )
 from utils.plugin_loader import load_broker_auth_functions
 from utils.security_middleware import init_security_middleware  # Import security middleware
+from utils.timing_middleware import register_timing_middleware
 from utils.socketio_error_handler import (
     init_socketio_error_handling,  # Import Socket.IO error handler
 )
@@ -214,6 +219,22 @@ from websocket_proxy.app_integration import start_websocket_proxy
 
 # Initialize logger
 logger = get_logger(__name__)
+
+
+def _setup_query_instrumentation(app):
+    from sqlalchemy import event
+    from database.db import engine as _db_engine
+    import time
+
+    @event.listens_for(_db_engine, "before_cursor_execute")
+    def before_cursor_execute(conn, cursor, statement, params, context, executemany):
+        conn.info.setdefault("query_start_time", []).append(time.time())
+
+    @event.listens_for(_db_engine, "after_cursor_execute")
+    def after_cursor_execute(conn, cursor, statement, params, context, executemany):
+        total = time.time() - conn.info["query_start_time"].pop(-1)
+        if total > 0.5:
+            logger.warning(f"SLOW QUERY ({total*1000:.0f}ms): {statement[:120]}")
 
 
 def create_app():
@@ -255,8 +276,11 @@ def create_app():
 
     # Environment variables
     app.secret_key = os.getenv("APP_KEY")
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+    from utils.database_config import get_resolved_database_urls
 
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL") or get_resolved_database_urls()[
+        "DATABASE_URL"
+    ]
     # Dynamic cookie security configuration based on HOST_SERVER
     HOST_SERVER = os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
     USE_HTTPS = HOST_SERVER.startswith("https://")
@@ -291,6 +315,8 @@ def create_app():
     # Add cookie prefix for CSRF token in HTTPS environments
     if USE_HTTPS:
         app.config["WTF_CSRF_COOKIE_NAME"] = f"__Secure-{csrf_cookie_name}"
+
+    register_timing_middleware(app)
 
     # Parse CSRF time limit from environment
     csrf_time_limit = os.getenv("CSRF_TIME_LIMIT", "").strip()
@@ -397,19 +423,16 @@ def create_app():
 
     @app.before_request
     def wait_for_db_ready():
-        """Block requests until background database initialization completes."""
+        """Block non-API requests until background database initialization completes."""
         from flask import request
 
-        # Static assets don't need DB
-        if (
-            request.path.startswith("/static/")
-            or request.path.startswith("/assets/")
-        ):
+        if request.path.startswith("/api/"):
+            return
+        if request.path.startswith("/static/") or request.path.startswith("/assets/"):
             return
 
-        # Wait up to 30s for DB init (typically ~3.5s)
         if hasattr(app, "db_ready") and not app.db_ready.is_set():
-            app.db_ready.wait(timeout=30)
+            app.db_ready.wait(timeout=10)
 
     @app.before_request
     def check_session_expiry():
@@ -561,6 +584,12 @@ def setup_environment(app):
     # Event to signal when DB init is complete (cache restoration waits on this)
     app.db_ready = threading.Event()
 
+    # NOTE (Neon / remote-PG): The former synchronous ensure_sandbox_tables_exists()
+    # call has been moved fully into the background thread below.
+    # Zero blocking DB calls happen on the main thread before socketio.run().
+    # The wait_for_db_ready() before_request hook protects against requests
+    # arriving before the background init finishes.
+
     def _init_databases_and_schedulers():
         with app.app_context():
             import time
@@ -569,6 +598,10 @@ def setup_environment(app):
             from database.chart_prefs_db import ensure_chart_prefs_tables_exists
             from database.market_calendar_db import ensure_market_calendar_tables_exists
             from database.qty_freeze_db import ensure_qty_freeze_tables_exists
+            from database.master_contract_status_db import (
+                init_db as ensure_master_contract_status_tables_exists,
+            )
+            from database.trading_db import ensure_trading_tables_exists
 
             db_init_functions = [
                 ("Auth DB", ensure_auth_tables_exists),
@@ -580,8 +613,10 @@ def setup_environment(app):
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
+                ("Master Contract Status DB", ensure_master_contract_status_tables_exists),
                 ("Strategy DB", ensure_strategy_tables_exists),
                 ("Sandbox DB", ensure_sandbox_tables_exists),
+                ("Trading DB", ensure_trading_tables_exists),
                 ("Action Center DB", ensure_action_center_tables_exists),
                 ("Chart Prefs DB", ensure_chart_prefs_tables_exists),
                 ("Market Calendar DB", ensure_market_calendar_tables_exists),
@@ -730,8 +765,169 @@ def setup_environment(app):
 
 app = create_app()
 
+
+def _is_market_hours_ist() -> bool:
+    """Return True when the Indian market is open on the current IST clock."""
+    import pytz
+    from datetime import datetime
+
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    if now.weekday() >= 5:
+        return False
+
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
+_pool_monitor_started = False
+
+
+def _pool_monitor_loop():
+    """Background loop that logs SQLAlchemy pool health during market hours."""
+    import time
+
+    while True:
+        try:
+            if _is_market_hours_ist():
+                from utils.database_config import log_pool_status
+                from database.traffic_db import _ensure_worker_running, log_queue_status
+
+                log_pool_status()
+                _ensure_worker_running()
+                log_queue_status()
+        except Exception as e:
+            logger.exception(f"Error logging database pool status: {e}")
+
+        time.sleep(60)
+
+
+def _start_pool_monitor_thread():
+    """Start the pool monitor once per process, skipping the debug parent."""
+    global _pool_monitor_started
+
+    if _pool_monitor_started:
+        return
+
+    flask_debug = os.getenv("FLASK_DEBUG", "").lower() in ("true", "1", "t")
+    if flask_debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+
+    import threading
+
+    _pool_monitor_started = True
+    threading.Thread(target=_pool_monitor_loop, name="DBPoolMonitor", daemon=True).start()
+    logger.debug("Started DB pool monitor thread")
+
+
+@app.route("/system/pool-status", methods=["GET"])
+def get_system_pool_status():
+    """Return live SQLAlchemy pool statistics for monitoring."""
+    from flask import jsonify
+    from utils.database_config import get_pool_status
+
+    return jsonify({"status": "success", "data": get_pool_status()})
+
+
+@app.route("/system/queue-status", methods=["GET"])
+def get_system_queue_status():
+    """Return live traffic log queue statistics for monitoring."""
+    from database.traffic_db import get_queue_status
+
+    return get_queue_status()
+
+
+@app.route("/system/db-latency", methods=["GET"])
+def get_system_db_latency():
+    """Measure basic round-trip latency for each configured database."""
+    import time
+
+    from flask import jsonify, request
+    from sqlalchemy import text
+
+    from utils.database_config import get_engine, get_resolved_database_urls
+
+    token = request.args.get("token", "")
+    if token != os.getenv("APP_KEY"):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
+    resolved_urls = get_resolved_database_urls()
+    labels = {
+        "DATABASE_URL": "openalgo",
+        "LOGS_DATABASE_URL": "openalgo_logs",
+        "LATENCY_DATABASE_URL": "openalgo_latency",
+        "SANDBOX_DATABASE_URL": "openalgo_sandbox",
+        "HEALTH_DATABASE_URL": "openalgo_health",
+    }
+
+    results = {}
+    slow_detected = False
+
+    for env_var, database_url in resolved_urls.items():
+        if not database_url:
+            continue
+        label = labels.get(env_var, env_var.lower())
+        engine = get_engine(database_url, db_name=label)
+        samples: list[float] = []
+        try:
+            for _ in range(5):
+                start = time.perf_counter()
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                samples.append((time.perf_counter() - start) * 1000)
+        except Exception as exc:
+            results[label] = {"error": str(exc)}
+            continue
+
+        if samples:
+            avg_ms = sum(samples) / len(samples)
+            min_ms = min(samples)
+            max_ms = max(samples)
+            results[label] = {
+                "avg_ms": round(avg_ms, 1),
+                "min_ms": round(min_ms, 1),
+                "max_ms": round(max_ms, 1),
+            }
+            if avg_ms > 100:
+                slow_detected = True
+
+    recommendation = (
+        "High latency detected. Each trade request makes ~13 round trips = ~1800ms minimum DB overhead."
+        if slow_detected
+        else "Database latency is within acceptable bounds."
+    )
+    return jsonify({"databases": results, "recommendation": recommendation})
+
 # Explicitly call the setup environment function
 setup_environment(app)
+
+# --- Neon keepalive: prevent compute suspension mid-session ---
+# Neon serverless suspends the compute node after ~5 min of inactivity.
+# A lightweight SELECT 1 every 4 minutes keeps it warm while the app is running.
+def _neon_keepalive_loop():
+    import time
+    from sqlalchemy import text
+    from database.auth_db import db_session
+
+    while True:
+        time.sleep(240)  # 4 minutes
+        try:
+            with app.app_context():
+                db_session.execute(text("SELECT 1"))
+                db_session.remove()
+        except Exception:
+            pass  # Never crash; Neon will recover on the next real request
+
+
+if "neon.tech" in os.getenv("DATABASE_URL", ""):
+    import threading as _threading
+    _threading.Thread(
+        target=_neon_keepalive_loop,
+        name="NeonKeepalive",
+        daemon=True,
+    ).start()
+    logger.debug("[Neon] Keepalive thread started (pings every 4 min)")
 
 # Restore caches from database in background (not needed until first trade/lookup)
 import threading
@@ -759,41 +955,23 @@ def _restore_caches_background():
             logger.debug(f"Cache restoration skipped: {e}")
 
 threading.Thread(target=_restore_caches_background, daemon=True).start()
+_start_pool_monitor_thread()
 
 
 # Database session cleanup (teardown handler)
 @app.teardown_appcontext
 def shutdown_database_sessions(exception=None):
-    """Remove scoped sessions after each request to prevent FD leaks"""
+    """Remove the shared scoped session after each request."""
     try:
-        from database.auth_db import db_session
-        db_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing auth db_session: {e}")
-
-    try:
+        from database.db import Session
+        from database.latency_db import latency_session
         from database.traffic_db import logs_session
+
+        Session.remove()
+        latency_session.remove()
         logs_session.remove()
     except Exception as e:
-        logger.error(f"Error removing logs_session: {e}")
-
-    try:
-        from database.apilog_db import db_session as apilog_session
-        apilog_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing apilog_session: {e}")
-
-    try:
-        from database.latency_db import latency_session
-        latency_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing latency_session: {e}")
-
-    try:
-        from database.health_db import health_session
-        health_session.remove()
-    except Exception as e:
-        logger.error(f"Error removing health_session: {e}")
+        logger.error(f"Error removing database session: {e}")
 
 
 # Integrate the WebSocket proxy server with the Flask app
@@ -810,7 +988,10 @@ if is_docker:
     )
 else:
     logger.debug("Running in local/integrated mode - Starting WebSocket proxy in Flask")
-    start_websocket_proxy(app)
+    try:
+        start_websocket_proxy(app)
+    except Exception as e:
+        logger.exception(f"WebSocket proxy failed to start; continuing without it: {e}")
 
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == "__main__":
@@ -837,4 +1018,11 @@ if __name__ == "__main__":
             "*.bak",
         ]
     }
-    socketio.run(app, host=host_ip, port=port, debug=debug, reloader_options=reloader_options)
+    socketio.run(
+        app,
+        host=host_ip,
+        port=port,
+        debug=debug,
+        reloader_options=reloader_options,
+        allow_unsafe_werkzeug=True,
+    )

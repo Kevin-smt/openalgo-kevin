@@ -16,11 +16,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 from cachetools import TTLCache
-from sqlalchemy import BigInteger, Boolean, Column, Date, Index, Integer, String, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy import BigInteger, Boolean, Column, Date, Index, Integer, String
 
+from database.db import Base, Session, engine
 from utils.constants import CRYPTO_EXCHANGES, EXCHANGE_CRYPTO
 from utils.logging import get_logger
 
@@ -32,20 +30,10 @@ logger = get_logger(__name__)
 # Cache for market timings - 1 hour TTL
 _timings_cache = TTLCache(maxsize=500, ttl=3600)
 _holidays_cache = TTLCache(maxsize=50, ttl=3600)
+_timing_offsets_cache = TTLCache(maxsize=1, ttl=3600)
+_holiday_lookup_cache = TTLCache(maxsize=4096, ttl=3600)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Conditionally create engine based on DB type
-if DATABASE_URL and "sqlite" in DATABASE_URL:
-    engine = create_engine(
-        DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    engine = create_engine(DATABASE_URL, pool_size=50, max_overflow=100, pool_timeout=10)
-
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+db_session = Session
 
 # Supported exchanges
 SUPPORTED_EXCHANGES = ["NSE", "BSE", "NFO", "BFO", "MCX", "BCD", "CDS", "CRYPTO"]
@@ -579,16 +567,23 @@ def _get_timing_offsets() -> dict[str, dict[str, int]]:
     Get timing offsets from database or fallback to defaults.
     This ensures edited timings from admin page are used.
     """
+    cache_key = "timing_offsets"
+    if cache_key in _timing_offsets_cache:
+        return _timing_offsets_cache[cache_key]
+
     try:
         timings = MarketTiming.query.all()
         if timings:
-            return {
+            result = {
                 t.exchange_code: {"start_offset": t.start_offset, "end_offset": t.end_offset}
                 for t in timings
             }
+            _timing_offsets_cache[cache_key] = result
+            return result
     except Exception as e:
         logger.debug(f"Error fetching timing offsets from DB, using defaults: {e}")
 
+    _timing_offsets_cache[cache_key] = DEFAULT_MARKET_TIMINGS
     return DEFAULT_MARKET_TIMINGS
 
 
@@ -729,9 +724,14 @@ def is_market_holiday(query_date: date, exchange: str = None) -> bool:
     Returns:
         True if it's a holiday (or weekend), False otherwise
     """
+    cache_key = f"{query_date.isoformat()}:{exchange.upper() if exchange else '*'}"
+    if cache_key in _holiday_lookup_cache:
+        return _holiday_lookup_cache[cache_key]
+
     try:
         # Crypto exchanges operate 24/7 - no holidays or weekends
         if exchange and exchange.upper() in CRYPTO_EXCHANGES:
+            _holiday_lookup_cache[cache_key] = False
             return False
 
         # Check for special session FIRST (before weekend check)
@@ -740,13 +740,16 @@ def is_market_holiday(query_date: date, exchange: str = None) -> bool:
 
         # Special sessions are not holidays - markets are open with special timings
         if holiday and holiday.holiday_type == "SPECIAL_SESSION":
+            _holiday_lookup_cache[cache_key] = False
             return False
 
         # Weekend check (only if no special session)
         if query_date.weekday() >= 5:
+            _holiday_lookup_cache[cache_key] = True
             return True
 
         if not holiday:
+            _holiday_lookup_cache[cache_key] = False
             return False
 
         if exchange:
@@ -757,21 +760,29 @@ def is_market_holiday(query_date: date, exchange: str = None) -> bool:
             ).first()
 
             if exchange_info:
-                return not exchange_info.is_open
+                result = not exchange_info.is_open
+                _holiday_lookup_cache[cache_key] = result
+                return result
+            _holiday_lookup_cache[cache_key] = False
             return False  # Exchange not in holiday list means it's open
 
+        _holiday_lookup_cache[cache_key] = True
         return True  # It's a holiday
     except Exception as e:
         # Handle case where tables don't exist yet (fresh installation)
         # Fall back to simple weekend check
         logger.debug(f"Holiday check unavailable (tables may not exist yet): {e}")
-        return query_date.weekday() >= 5  # Return True only for weekends
+        result = query_date.weekday() >= 5
+        _holiday_lookup_cache[cache_key] = result
+        return result  # Return True only for weekends
 
 
 def clear_market_calendar_cache():
     """Clear all market calendar caches"""
     _timings_cache.clear()
     _holidays_cache.clear()
+    _timing_offsets_cache.clear()
+    _holiday_lookup_cache.clear()
     logger.info("Market calendar cache cleared")
 
 
@@ -965,11 +976,15 @@ def update_market_timing(exchange: str, start_time: str, end_time: str) -> bool:
 
 def get_market_timing(exchange: str) -> dict[str, Any] | None:
     """Get market timing for a specific exchange"""
+    cache_key = exchange.upper()
+    if cache_key in _timings_cache:
+        return _timings_cache[cache_key]
+
     try:
-        timing = MarketTiming.query.filter_by(exchange_code=exchange.upper()).first()
+        timing = MarketTiming.query.filter_by(exchange_code=cache_key).first()
 
         if timing:
-            return {
+            result = {
                 "id": timing.id,
                 "exchange": timing.exchange_code,
                 "start_time": timing.start_time,
@@ -977,10 +992,12 @@ def get_market_timing(exchange: str) -> dict[str, Any] | None:
                 "start_offset": timing.start_offset,
                 "end_offset": timing.end_offset,
             }
+            _timings_cache[cache_key] = result
+            return result
 
         # Fallback to default
-        if exchange.upper() in DEFAULT_MARKET_TIMINGS:
-            timing_data = DEFAULT_MARKET_TIMINGS[exchange.upper()]
+        if cache_key in DEFAULT_MARKET_TIMINGS:
+            timing_data = DEFAULT_MARKET_TIMINGS[cache_key]
             start_offset = timing_data["start_offset"]
             end_offset = timing_data["end_offset"]
             start_hours = start_offset // 3600000
@@ -988,14 +1005,16 @@ def get_market_timing(exchange: str) -> dict[str, Any] | None:
             end_hours = end_offset // 3600000
             end_mins = (end_offset % 3600000) // 60000
 
-            return {
+            result = {
                 "id": None,
-                "exchange": exchange.upper(),
+                "exchange": cache_key,
                 "start_time": f"{start_hours:02d}:{start_mins:02d}",
                 "end_time": f"{end_hours:02d}:{end_mins:02d}",
                 "start_offset": start_offset,
                 "end_offset": end_offset,
             }
+            _timings_cache[cache_key] = result
+            return result
 
         return None
 

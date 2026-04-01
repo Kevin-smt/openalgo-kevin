@@ -1,7 +1,5 @@
 import json
-from datetime import datetime, timedelta
-
-import pytz
+from datetime import timedelta
 from sqlalchemy import func
 
 from database.analyzer_db import AnalyzerLog, db_session
@@ -25,6 +23,7 @@ from utils.constants import (
     VALID_PRODUCT_TYPES,
 )
 from utils.logging import get_logger
+from utils.timezone import now_ist
 
 logger = get_logger(__name__)
 
@@ -35,7 +34,7 @@ _order_sequence = 0
 def generate_order_id():
     """Generate a sequential order ID in format YYMMDDXXXXXXXX"""
     global _order_sequence
-    now = datetime.now()
+    now = now_ist()
     date_prefix = now.strftime("%y%m%d")
 
     # Get the last order from analyzer logs to ensure sequence continuity
@@ -71,7 +70,7 @@ def generate_order_id():
 def check_rate_limits(user_id):
     """Check if user has hit rate limits recently"""
     try:
-        cutoff = datetime.now(pytz.UTC) - timedelta(minutes=5)
+        cutoff = now_ist() - timedelta(minutes=5)
         rate_limited = AnalyzerLog.query.filter(
             AnalyzerLog.created_at >= cutoff, AnalyzerLog.response_data.like("%rate limit%")
         ).count()
@@ -167,7 +166,7 @@ def analyze_api_request(order_data):
         try:
             if (
                 AnalyzerLog.query.filter(
-                    AnalyzerLog.created_at >= datetime.now(pytz.UTC) - timedelta(minutes=1)
+                    AnalyzerLog.created_at >= now_ist() - timedelta(minutes=1)
                 ).count()
                 > 50
             ):
@@ -270,7 +269,7 @@ def analyze_smart_order_request(order_data):
         try:
             if (
                 AnalyzerLog.query.filter(
-                    AnalyzerLog.created_at >= datetime.now(pytz.UTC) - timedelta(minutes=1)
+                    AnalyzerLog.created_at >= now_ist() - timedelta(minutes=1)
                 ).count()
                 > 50
             ):
@@ -310,7 +309,7 @@ def analyze_cancel_order_request(order_data):
         try:
             if (
                 AnalyzerLog.query.filter(
-                    AnalyzerLog.created_at >= datetime.now(pytz.UTC) - timedelta(minutes=1)
+                    AnalyzerLog.created_at >= now_ist() - timedelta(minutes=1)
                 ).count()
                 > 50
             ):
@@ -350,7 +349,7 @@ def analyze_cancel_all_order_request(order_data):
         try:
             if (
                 AnalyzerLog.query.filter(
-                    AnalyzerLog.created_at >= datetime.now(pytz.UTC) - timedelta(minutes=1)
+                    AnalyzerLog.created_at >= now_ist() - timedelta(minutes=1)
                 ).count()
                 > 50
             ):
@@ -390,7 +389,7 @@ def analyze_close_position_request(order_data):
         try:
             if (
                 AnalyzerLog.query.filter(
-                    AnalyzerLog.created_at >= datetime.now(pytz.UTC) - timedelta(minutes=1)
+                    AnalyzerLog.created_at >= now_ist() - timedelta(minutes=1)
                 ).count()
                 > 50
             ):
@@ -490,7 +489,7 @@ def analyze_modify_order_request(order_data):
         try:
             if (
                 AnalyzerLog.query.filter(
-                    AnalyzerLog.created_at >= datetime.now(pytz.UTC) - timedelta(minutes=1)
+                    AnalyzerLog.created_at >= now_ist() - timedelta(minutes=1)
                 ).count()
                 > 50
             ):
@@ -546,7 +545,7 @@ def analyze_request(request_data, api_type="placeorder", should_log=False):
 def get_analyzer_stats():
     """Get analyzer statistics"""
     try:
-        cutoff = datetime.now(pytz.UTC) - timedelta(hours=24)
+        cutoff = now_ist() - timedelta(hours=24)
 
         # Get recent requests
         recent_requests = AnalyzerLog.query.filter(AnalyzerLog.created_at >= cutoff).all()

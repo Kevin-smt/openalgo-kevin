@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { todayIstIsoDate } from '@/utils/time'
 
 interface MarketTiming {
   exchange: string
@@ -89,7 +90,7 @@ export function useMarketStatus() {
       // Crypto exchanges have no holidays
       if (CRYPTO_EXCHANGES.has(exchange)) return false
 
-      const today = new Date().toISOString().split('T')[0] // YYYY-MM-DD format
+      const today = todayIstIsoDate() // YYYY-MM-DD IST format
       const todayHoliday = state.holidays.find((h) => h.date === today)
 
       if (!todayHoliday) return false

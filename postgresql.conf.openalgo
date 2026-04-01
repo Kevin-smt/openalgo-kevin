@@ -1,0 +1,13 @@
+# OpenAlgo PostgreSQL tuning for high-frequency trading workloads
+
+max_connections = 200
+shared_buffers = 256MB
+effective_cache_size = 1GB
+
+# Optional safety defaults for a low-latency app
+wal_compression = on
+checkpoint_completion_target = 0.9
+default_statistics_target = 100
+tcp_keepalives_idle = 60
+tcp_keepalives_interval = 30
+tcp_keepalives_count = 5

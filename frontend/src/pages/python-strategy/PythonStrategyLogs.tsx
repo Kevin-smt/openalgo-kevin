@@ -6,6 +6,7 @@ import { pythonStrategyApi } from '@/api/python-strategy'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { formatIstDateTime } from '@/utils/time'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
@@ -228,7 +229,7 @@ export default function PythonStrategyLogs() {
                       <div className="font-medium text-sm truncate">{formatLogName(log.name)}</div>
                       <div className="flex items-center gap-2 mt-1 text-xs opacity-80">
                         <Clock className="h-3 w-3" />
-                        {new Date(log.last_modified).toLocaleString('en-IN', {
+                        {formatIstDateTime(log.last_modified, {
                           day: '2-digit',
                           month: 'short',
                           hour: '2-digit',
@@ -262,7 +263,7 @@ export default function PythonStrategyLogs() {
             {logContent && (
               <CardDescription>
                 {logContent.lines} lines • {logContent.size_kb.toFixed(2)} KB • Last updated:{' '}
-                {new Date(logContent.last_updated).toLocaleString()}
+                {formatIstDateTime(logContent.last_updated)}
               </CardDescription>
             )}
           </CardHeader>

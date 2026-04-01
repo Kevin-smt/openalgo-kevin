@@ -11,6 +11,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { showToast } from '@/utils/toast'
+import { formatIstDateTime } from '@/utils/time'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -293,7 +294,7 @@ export default function EditPythonStrategy() {
         {content.last_modified && (
           <>
             <span>•</span>
-            <span>Last modified: {new Date(content.last_modified).toLocaleString()}</span>
+            <span>Last modified: {formatIstDateTime(content.last_modified)}</span>
           </>
         )}
       </div>

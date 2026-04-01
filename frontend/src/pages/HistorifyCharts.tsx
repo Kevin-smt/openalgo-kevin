@@ -18,6 +18,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { showToast } from '@/utils/toast'
+import { shiftIstDate, todayIstIsoDate } from '@/utils/time'
 import { authApi } from '@/api/auth'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -130,12 +131,8 @@ export default function HistorifyCharts() {
   const [customIntervalUnit, setCustomIntervalUnit] = useState<'m' | 'h' | 'W' | 'M' | 'Q' | 'Y'>('m')
 
   // Date range
-  const [startDate, setStartDate] = useState(() => {
-    const d = new Date()
-    d.setMonth(d.getMonth() - 6)
-    return d.toISOString().split('T')[0]
-  })
-  const [endDate, setEndDate] = useState(() => new Date().toISOString().split('T')[0])
+  const [startDate, setStartDate] = useState(() => shiftIstDate(0, -6))
+  const [endDate, setEndDate] = useState(() => todayIstIsoDate())
 
   // Chart data
   const [chartData, setChartData] = useState<OHLCVData[]>([])

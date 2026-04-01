@@ -12,6 +12,7 @@ This solves the stale cache issue described in GitHub issue #765.
 import json
 import os
 import threading
+import time
 
 import zmq
 
@@ -43,6 +44,8 @@ class CacheInvalidationPublisher:
         self.socket = None
         self._initialized = False
         self._lock = threading.Lock()
+        self._dropped_messages = 0
+        self._last_drop_log = 0.0
 
     def _ensure_initialized(self):
         """Lazily initialize ZMQ connection on first use"""
@@ -64,8 +67,10 @@ class CacheInvalidationPublisher:
                 self.socket.connect(f"tcp://{zmq_host}:{zmq_port}")
 
                 # Set socket options
-                self.socket.setsockopt(zmq.LINGER, 1000)  # 1 second linger on close
-                self.socket.setsockopt(zmq.SNDHWM, 100)   # High water mark
+                self.socket.setsockopt(zmq.LINGER, 0)
+                self.socket.setsockopt(zmq.IMMEDIATE, 1)
+                self.socket.setsockopt(zmq.SNDHWM, int(os.getenv("ZMQ_CONTROL_SNDHWM", "10")))
+                self.socket.setsockopt(zmq.SNDTIMEO, 0)
 
                 self._initialized = True
                 logger.debug(f"Cache invalidation publisher connected to tcp://{zmq_host}:{zmq_port}")
@@ -97,13 +102,30 @@ class CacheInvalidationPublisher:
             }
 
             # Send as multipart message (topic + data)
-            self.socket.send_multipart([
-                topic.encode("utf-8"),
-                json.dumps(message).encode("utf-8")
-            ])
+            self.socket.send_multipart(
+                [
+                    topic.encode("utf-8"),
+                    json.dumps(message, separators=(",", ":")).encode("utf-8"),
+                ],
+                flags=zmq.NOBLOCK,
+            )
 
             logger.info(f"Published cache invalidation for user: {user_id}, type: {cache_type}")
             return True
+
+        except zmq.Again:
+            self._dropped_messages += 1
+            now = time.monotonic()
+            if now - self._last_drop_log > 5:
+                self._last_drop_log = now
+                logger.warning(
+                    "Cache invalidation dropped due to ZMQ backpressure "
+                    "(dropped=%s, user_id=%s, cache_type=%s)",
+                    self._dropped_messages,
+                    user_id,
+                    cache_type,
+                )
+            return False
 
         except Exception as e:
             logger.exception(f"Failed to publish cache invalidation for user {user_id}: {e}")
@@ -113,7 +135,7 @@ class CacheInvalidationPublisher:
         """Close ZMQ connections"""
         try:
             if self.socket:
-                self.socket.close()
+                self.socket.close(linger=0)
             if self.context:
                 self.context.term()
             self._initialized = False

@@ -1,6 +1,7 @@
 import { AlertTriangle, Camera, RefreshCw, TrendingDown, TrendingUp } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { showToast } from '@/utils/toast'
+import { nowIstIso } from '@/utils/time'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useThemeStore } from '@/stores/themeStore'
@@ -310,7 +311,7 @@ export default function PnLTracker() {
           if (!blob) return
           const url = URL.createObjectURL(blob)
           const link = document.createElement('a')
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5)
+          const timestamp = nowIstIso().replace(/[:.]/g, '-').slice(0, -5)
           link.download = `PnL_Tracker_${timestamp}.png`
           link.href = url
           document.body.appendChild(link)

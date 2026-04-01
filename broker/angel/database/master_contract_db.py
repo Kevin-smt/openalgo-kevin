@@ -7,19 +7,20 @@ from datetime import datetime
 
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from extensions import socketio  # Import SocketIO
 from utils.logging import get_logger
+from utils.database_config import bulk_insert_mappings_chunked, get_engine
 
 logger = get_logger(__name__)
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = get_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -51,44 +52,56 @@ def init_db():
 
 def delete_symtoken_table():
     logger.info("Deleting Symtoken Table")
-    SymToken.query.delete()
-    db_session.commit()
+    try:
+        SymToken.query.delete()
+        db_session.commit()
+    except Exception:
+        db_session.rollback()
+        raise
 
 
 def copy_from_dataframe(df):
     logger.info("Performing Chunked Insert ---")
-    chunk_size = int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "1000"))  # Default to 1000 if not set
+    chunk_size = int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "10000"))
+
+    total_rows = len(df)
+    if total_rows == 0:
+        logger.info("No new records to insert.")
+        return
+
+    logger.info(f"Angel master contract rows before de-dup: {total_rows}")
+    logger.info(
+        f"Starting chunked insert of {total_rows} records in chunks of {chunk_size}"
+    )
+
+    existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
+    chunk_records = df.to_dict(orient="records")
+    filtered_data_dict = [row for row in chunk_records if row["token"] not in existing_tokens]
+
+    logger.info(
+        f"Angel master contract rows after de-dup: {len(filtered_data_dict)} "
+        f"(skipped {total_rows - len(filtered_data_dict)})"
+    )
+
+    if not filtered_data_dict:
+        logger.info("No new Angel master contract records to insert after de-dup.")
+        return 0
 
     try:
-        total_rows = len(df)
-        if total_rows == 0:
-            logger.info("No new records to insert.")
-            return
-
-        logger.info(
-            f"Starting chunked insert of {total_rows} records in chunks of {chunk_size}"
+        inserted = bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=chunk_size,
+            logger=logger,
+            label="Angel master contract",
+            progress_every=1,
         )
-
-        inserted = 0
-        for start in range(0, total_rows, chunk_size):
-            end = min(start + chunk_size, total_rows)
-            chunk_df = df.iloc[start:end]
-            chunk_records = chunk_df.to_dict(orient="records")
-
-            if not chunk_records:
-                continue
-
-            db_session.bulk_insert_mappings(SymToken, chunk_records)
-            db_session.commit()
-            inserted += len(chunk_records)
-
-            if inserted % (chunk_size * 10) == 0 or inserted == total_rows:
-                logger.info(f"Inserted {inserted}/{total_rows} records")
-
-        logger.info(f"Chunked insert completed successfully with {inserted} records.")
+        logger.info(f"Angel master contract insert complete: {inserted} rows stored")
+        return inserted
     except Exception as e:
-        db_session.rollback()
-        logger.error(f"Error during chunked insert: {e}")
+        logger.exception(f"Error during chunked insert: {e}")
         raise
 
 
@@ -181,17 +194,17 @@ def process_angel_json(path):
     df["expiry"] = df["expiry"].apply(lambda x: convert_date(x) if pd.notnull(x) else x)
     df["expiry"] = df["expiry"].str.upper()
 
-    # Convert 'strike' to float, 'lotsize' to int, and 'tick_size' to float as per the database schema
-    df["strike"] = df["strike"].astype(float) / 100
+    # Convert numeric fields safely so malformed rows don't abort the whole import.
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce").fillna(0) / 100
     df.loc[(df["instrumenttype"] == "OPTCUR") & (df["exchange"] == "CDS"), "strike"] = (
-        df["strike"].astype(float) / 100000
+        pd.to_numeric(df["strike"], errors="coerce").fillna(0) / 100000
     )
     df.loc[(df["instrumenttype"] == "OPTIRC") & (df["exchange"] == "CDS"), "strike"] = (
-        df["strike"].astype(float) / 100000
+        pd.to_numeric(df["strike"], errors="coerce").fillna(0) / 100000
     )
 
-    df["lotsize"] = df["lotsize"].astype(int)
-    df["tick_size"] = df["tick_size"].astype(float) / 100  # Divide tick_size by 100
+    df["lotsize"] = pd.to_numeric(df["lotsize"], errors="coerce").fillna(0).astype(int)
+    df["tick_size"] = pd.to_numeric(df["tick_size"], errors="coerce").fillna(0) / 100  # Divide tick_size by 100
 
     # Futures Symbol Update in CDS and MCX Exchanges
     df.loc[(df["instrumenttype"] == "FUTCUR") & (df["exchange"] == "CDS"), "symbol"] = (
@@ -382,6 +395,12 @@ def process_angel_json(path):
     df.loc[df["instrumenttype"] == "FUTIRC", "instrumenttype"] = "FUT"
     df.loc[df["instrumenttype"] == "FUTIRT", "instrumenttype"] = "FUT"
 
+    df = df.dropna(subset=["symbol", "brsymbol", "exchange", "brexchange", "token", "name"])
+    df = df[df["symbol"].astype(str).str.strip() != ""]
+    df = df[df["token"].astype(str).str.strip() != ""]
+    df = df.drop_duplicates(subset=["token", "exchange"], keep="first")
+    logger.info(f"Angel master contract dataframe prepared with {len(df)} rows")
+
     # Return the processed DataFrame
     return df
 
@@ -404,6 +423,7 @@ def master_contract_download():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     output_path = "tmp/angel.json"
     try:
+        init_db()
         download_json_angel_data(url, output_path)
         token_df = process_angel_json(output_path)
         delete_angel_temp_data(output_path)
@@ -412,15 +432,17 @@ def master_contract_download():
         # token_df = token_df.drop_duplicates(subset='symbol', keep='first')
 
         delete_symtoken_table()  # Consider the implications of this action
-        copy_from_dataframe(token_df)
+        inserted = copy_from_dataframe(token_df)
 
-        return socketio.emit(
+        socketio.emit(
             "master_contract_download", {"status": "success", "message": "Successfully Downloaded"}
         )
+        return {"status": "success", "message": "Successfully Downloaded", "inserted_rows": inserted}
 
     except Exception as e:
-        logger.info(f"{str(e)}")
-        return socketio.emit("master_contract_download", {"status": "error", "message": str(e)})
+        logger.exception(f"Angel master contract download failed: {str(e)}")
+        socketio.emit("master_contract_download", {"status": "error", "message": str(e)})
+        raise
 
 
 def search_symbols(symbol, exchange):

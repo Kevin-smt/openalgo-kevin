@@ -7,6 +7,10 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+from utils.timezone import IST, configure_process_timezone, now_ist
+
+configure_process_timezone()
+
 # Load environment variables if .env file exists
 try:
     from dotenv import load_dotenv
@@ -280,12 +284,14 @@ def cleanup_old_logs(log_dir: Path, retention_days: int):
     if not log_dir.exists():
         return
 
-    cutoff_date = datetime.now() - timedelta(days=retention_days)
+    cutoff_date = now_ist().replace(tzinfo=None) - timedelta(days=retention_days)
 
     for log_file in log_dir.glob("*.log*"):
         try:
             # Get file modification time
-            file_mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+            file_mtime = datetime.fromtimestamp(
+                log_file.stat().st_mtime, tz=IST
+            ).replace(tzinfo=None)
             if file_mtime < cutoff_date:
                 log_file.unlink()
         except Exception:
@@ -315,6 +321,8 @@ def setup_logging():
     console_formatter = ColoredFormatter(log_format, enable_colors=log_colors)
     # Regular formatter for file output (no colors)
     file_formatter = logging.Formatter(log_format)
+    console_formatter.converter = lambda ts: datetime.fromtimestamp(ts, tz=IST).timetuple()
+    file_formatter.converter = lambda ts: datetime.fromtimestamp(ts, tz=IST).timetuple()
 
     # Add sensitive data filter
     sensitive_filter = SensitiveDataFilter()
@@ -334,7 +342,7 @@ def setup_logging():
         cleanup_old_logs(log_path, log_retention)
 
         # Create file handler with daily rotation
-        log_file = log_path / f"openalgo_{datetime.now().strftime('%Y-%m-%d')}.log"
+        log_file = log_path / f"openalgo_{now_ist().strftime('%Y-%m-%d')}.log"
         file_handler = TimedRotatingFileHandler(
             filename=str(log_file),
             when="midnight",

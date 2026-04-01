@@ -13,6 +13,7 @@ from email.mime.text import MIMEText
 
 from database.settings_db import get_smtp_settings
 from utils.logging import get_logger
+from utils.timezone import now_ist
 
 logger = get_logger(__name__)
 
@@ -126,7 +127,7 @@ def send_test_email(recipient_email, sender_name="OpenAlgo Admin"):
                     <tr>
                         <td style="padding: 0 40px 40px 40px; text-align: center;">
                             <p style="margin: 0; font-size: 13px; color: #52525b;">
-                                {datetime.now().strftime("%B %d, %Y at %H:%M UTC")}
+                                {now_ist().strftime("%B %d, %Y at %H:%M IST")}
                             </p>
                             <p style="margin: 16px 0 0 0; font-size: 12px; color: #3f3f46;">
                                 Sent by <span style="color: #a1a1aa;">OpenAlgo</span>
@@ -151,7 +152,7 @@ Server: {smtp_settings["smtp_server"]}:{smtp_settings["smtp_port"]}
 Security: {"TLS/SSL Enabled" if smtp_settings.get("smtp_use_tls") else "No Encryption"}
 Sent to: {recipient_email}
 
-Date: {datetime.now().strftime("%B %d, %Y at %H:%M UTC")}
+Date: {now_ist().strftime("%B %d, %Y at %H:%M IST")}
 
 --
 Sent by OpenAlgo

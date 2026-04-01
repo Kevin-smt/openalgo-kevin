@@ -1,35 +1,96 @@
 import logging
-import os
-from datetime import datetime
+import queue
+import threading
+import time
+from datetime import timedelta
 
-from sqlalchemy import JSON, Column, DateTime, Float, Integer, String, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy import JSON, Column, DateTime, Float, Integer, String
 from sqlalchemy.sql import func
+
+from database.db import Base
+from utils.database_config import get_engine, get_resolved_database_urls
+from utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
-# Use a separate database for latency logs
-LATENCY_DATABASE_URL = os.getenv("LATENCY_DATABASE_URL", "sqlite:///db/latency.db")
-
-# Conditionally create engine based on DB type
-if LATENCY_DATABASE_URL and "sqlite" in LATENCY_DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    latency_engine = create_engine(
-        LATENCY_DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    latency_engine = create_engine(
-        LATENCY_DATABASE_URL, pool_size=50, max_overflow=100, pool_timeout=10
-    )
+resolved_urls = get_resolved_database_urls()
+latency_engine = get_engine(resolved_urls["LATENCY_DATABASE_URL"], db_name="openalgo_latency")
+from sqlalchemy.orm import scoped_session, sessionmaker
 
 latency_session = scoped_session(
-    sessionmaker(autocommit=False, autoflush=False, bind=latency_engine)
+    sessionmaker(bind=latency_engine, autocommit=False, autoflush=False)
 )
-LatencyBase = declarative_base()
-LatencyBase.query = latency_session.query_property()
+LatencyBase = Base
+
+_WRITE_QUEUE: queue.Queue = queue.Queue(maxsize=10_000)
+_WORKER_LOCK = threading.Lock()
+_WORKER_THREAD: threading.Thread | None = None
+_SUPERVISOR_STARTED = False
+
+
+def _start_worker_locked() -> None:
+    global _WORKER_THREAD
+    worker = threading.Thread(target=_worker_loop, name="LatencyDBWorker", daemon=True)
+    worker.start()
+    _WORKER_THREAD = worker
+
+
+def _ensure_worker_running() -> None:
+    global _WORKER_THREAD
+    if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+        return
+    with _WORKER_LOCK:
+        if _WORKER_THREAD is None or not _WORKER_THREAD.is_alive():
+            _start_worker_locked()
+
+
+def _supervisor_loop() -> None:
+    while True:
+        try:
+            _ensure_worker_running()
+        except Exception:
+            logger.exception("Latency DB worker supervisor failed to restart worker")
+        time.sleep(2)
+
+
+def _start_supervisor() -> None:
+    global _SUPERVISOR_STARTED
+    if _SUPERVISOR_STARTED:
+        return
+    with _WORKER_LOCK:
+        if _SUPERVISOR_STARTED:
+            return
+        _SUPERVISOR_STARTED = True
+        threading.Thread(target=_supervisor_loop, name="LatencyDBSupervisor", daemon=True).start()
+
+
+def _enqueue(payload: dict[str, object]) -> bool:
+    _ensure_worker_running()
+    try:
+        _WRITE_QUEUE.put_nowait(payload)
+        return True
+    except queue.Full:
+        return False
+
+
+def _worker_loop() -> None:
+    while True:
+        try:
+            payload = _WRITE_QUEUE.get(timeout=2)
+        except queue.Empty:
+            continue
+
+        try:
+            with latency_session() as session:
+                session.add(OrderLatency(**payload))
+                session.commit()
+        except Exception as exc:
+            logger.exception(f"Latency DB worker failed to persist event: {exc}")
+        finally:
+            _WRITE_QUEUE.task_done()
+
+
+_start_supervisor()
 
 
 class OrderLatency(LatencyBase):
@@ -38,12 +99,12 @@ class OrderLatency(LatencyBase):
     __tablename__ = "order_latency"
 
     id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    order_id = Column(String(100), nullable=False)
-    user_id = Column(Integer)
-    broker = Column(String(50))
-    symbol = Column(String(50))
-    order_type = Column(String(20))  # MARKET, LIMIT, etc.
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    order_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, index=True)
+    broker = Column(String(50), index=True)
+    symbol = Column(String(50), index=True)
+    order_type = Column(String(20), index=True)  # MARKET, LIMIT, etc.
 
     # Round-trip time (comparable to Postman/Bruno)
     rtt_ms = Column(Float)
@@ -76,30 +137,25 @@ class OrderLatency(LatencyBase):
         error=None,
     ):
         """Log order execution latency"""
-        try:
-            log = OrderLatency(
-                order_id=order_id,
-                user_id=user_id,
-                broker=broker,
-                symbol=symbol,
-                order_type=order_type,
-                rtt_ms=latencies.get("rtt", 0),
-                validation_latency_ms=latencies.get("validation", 0),
-                response_latency_ms=latencies.get("broker_response", 0),
-                overhead_ms=latencies.get("overhead", 0),
-                total_latency_ms=latencies.get("total", 0),
-                request_body=request_body,
-                response_body=response_body,
-                status=status,
-                error=error,
-            )
-            latency_session.add(log)
-            latency_session.commit()
-            return True
-        except Exception as e:
-            logger.exception(f"Error logging latency: {str(e)}")
-            latency_session.rollback()
-            return False
+        _enqueue(
+            {
+                "order_id": order_id,
+                "user_id": user_id,
+                "broker": broker,
+                "symbol": symbol,
+                "order_type": order_type,
+                "rtt_ms": latencies.get("rtt", 0),
+                "validation_latency_ms": latencies.get("validation", 0),
+                "response_latency_ms": latencies.get("broker_response", 0),
+                "overhead_ms": latencies.get("overhead", 0),
+                "total_latency_ms": latencies.get("total", 0),
+                "request_body": request_body,
+                "response_body": response_body,
+                "status": status,
+                "error": error,
+            }
+        )
+        return True
 
     @staticmethod
     def get_recent_logs(limit=100):
@@ -273,12 +329,6 @@ class OrderLatency(LatencyBase):
 
 def init_latency_db():
     """Initialize the latency database"""
-    # Extract directory from database URL and create if it doesn't exist
-    db_path = LATENCY_DATABASE_URL.replace("sqlite:///", "")
-    db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(LatencyBase, latency_engine, "Latency DB", logger)
@@ -306,7 +356,7 @@ def purge_old_data_logs(days=7):
     try:
         from datetime import timedelta
 
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = now_ist() - timedelta(days=days)
 
         # Delete non-order logs older than cutoff
         deleted = (
@@ -322,3 +372,9 @@ def purge_old_data_logs(days=7):
         logger.exception(f"Error purging old latency logs: {str(e)}")
         latency_session.rollback()
         return 0
+
+
+def get_queue_status() -> dict[str, object]:
+    """Return the latency write queue status."""
+    _ensure_worker_running()
+    return {"queue_size": _WRITE_QUEUE.qsize(), "worker_alive": bool(_WORKER_THREAD and _WORKER_THREAD.is_alive())}

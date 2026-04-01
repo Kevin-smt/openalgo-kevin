@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
+from database.trading_db import _resolve_ledger_user_id, mirror_live_order
 from events import AnalyzerErrorEvent, BasketCompletedEvent, OrderFailedEvent
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
@@ -120,6 +121,8 @@ def place_single_order(
     auth_token: str,
     total_orders: int,
     order_index: int,
+    api_key: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Place a single order (no per-order event emission - summary event emitted at end)
@@ -135,11 +138,48 @@ def place_single_order(
         Order result dictionary
     """
     try:
+        resolved_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
+        logger.info(
+            "[LEDGER DEBUG] basket place_single_order entered: user_id=%s resolved_user_id=%s broker=%s symbol=%s order_index=%s/%s",
+            user_id,
+            resolved_user_id,
+            broker_module.__name__.split(".")[1] if hasattr(broker_module, "__name__") else "",
+            order_data.get("symbol"),
+            order_index + 1,
+            total_orders,
+        )
         # Place the order
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
         if res.status == 200:
             # No per-order event emission - a summary event is emitted at the end of all orders
+            logger.info(
+                f"[LEDGER DEBUG] Attempting mirror_live_order for basket order user={user_id}, "
+                f"broker={broker_module.__name__.split('.')[1] if hasattr(broker_module, '__name__') else ''}, "
+                f"symbol={order_data.get('symbol')}, orderid={order_id}"
+            )
+            logger.info(
+                "[LEDGER DEBUG] basket success branch before mirror: resolved_user_id=%s response_keys=%s",
+                resolved_user_id,
+                list(response_data.keys()) if isinstance(response_data, dict) else type(response_data).__name__,
+            )
+            mirror_live_order(
+                order_data=order_data,
+                broker=broker_module.__name__.split(".")[1] if hasattr(broker_module, "__name__") else "",
+                api_key=api_key,
+                broker_order_id=str(order_id),
+                order_status="open",
+                broker_response=response_data if isinstance(response_data, dict) else {"status": "success"},
+                user_id=resolved_user_id,
+                api_source="basketorder",
+            )
+            logger.info("[LEDGER DEBUG] mirror_live_order completed successfully")
+            try:
+                from services.trading_sync_service import sync_live_trading_state
+
+                sync_live_trading_state(api_key, reason="basketorder")
+            except Exception as exc:
+                logger.warning(f"[LEDGER DEBUG] live trading sync after basketorder failed: {exc}")
             return {"symbol": order_data["symbol"], "status": "success", "orderid": order_id}
         else:
             message = (
@@ -147,6 +187,31 @@ def place_single_order(
                 if isinstance(response_data, dict)
                 else "Failed to place order"
             )
+            mirror_live_order(
+                order_data=order_data,
+                broker=broker_module.__name__.split(".")[1] if hasattr(broker_module, "__name__") else "",
+                api_key=api_key,
+                broker_order_id=str(response_data.get("orderid")) if isinstance(response_data, dict) and response_data.get("orderid") else None,
+                order_status="rejected",
+                broker_response=response_data if isinstance(response_data, dict) else {"status": "error", "message": message},
+                rejection_reason=message,
+                user_id=resolved_user_id,
+                api_source="basketorder",
+            )
+            logger.info("[LEDGER DEBUG] mirror_live_order completed successfully")
+            logger.info(
+                "[LEDGER DEBUG] basket rejection branch before mirror: resolved_user_id=%s response_keys=%s",
+                resolved_user_id,
+                list(response_data.keys()) if isinstance(response_data, dict) else type(response_data).__name__,
+            )
+            try:
+                from services.trading_sync_service import sync_live_trading_state
+
+                sync_live_trading_state(api_key, reason="basketorder_rejected")
+            except Exception as exc:
+                logger.warning(
+                    f"[LEDGER DEBUG] live trading sync after basketorder rejection failed: {exc}"
+                )
             return {"symbol": order_data["symbol"], "status": "error", "message": message}
 
     except Exception as e:
@@ -181,6 +246,7 @@ def process_basket_order_with_auth(
         basket_request_data.pop("apikey", None)
 
     api_key = basket_data.get("apikey")
+    user_id = _resolve_ledger_user_id(api_key=api_key)
 
     # If in analyze mode, route each order to sandbox
     if get_analyze_mode():
@@ -305,7 +371,14 @@ def process_basket_order_with_auth(
         with ThreadPoolExecutor(max_workers=len(batch)) as executor:
             future_to_order = {
                 executor.submit(
-                    place_single_order, order_data, broker_module, auth_token, total_orders, batch_start + idx
+                    place_single_order,
+                    order_data,
+                    broker_module,
+                    auth_token,
+                    total_orders,
+                    batch_start + idx,
+                    api_key,
+                    user_id,
                 ): order_data
                 for idx, order_data in enumerate(batch)
             }

@@ -5,7 +5,8 @@ from flask import g, request
 from flask_restx import Resource
 
 from database.auth_db import get_broker_name
-from database.latency_db import OrderLatency, init_latency_db, latency_session, purge_old_data_logs
+from database.latency_db import OrderLatency, init_latency_db, purge_old_data_logs
+from utils.async_db_logger import async_log
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -167,23 +168,24 @@ def track_latency(api_type):
                 if "apikey" in request_data:
                     broker_name = get_broker_name(request_data["apikey"])
 
-                OrderLatency.log_latency(
-                    order_id=order_id,
-                    user_id=g.get("user_id"),
-                    broker=broker_name,
-                    symbol=request_data.get("symbol"),
-                    order_type=api_type,
-                    latencies={
-                        "rtt": rtt,  # Round-trip time (comparable to Postman/Bruno)
-                        "validation": tracker.stage_times.get("validation", 0),
-                        "broker_response": tracker.stage_times.get("broker_response", 0),
-                        "overhead": overhead,
-                        "total": total,
+                async_log(
+                    OrderLatency,
+                    {
+                        "order_id": order_id,
+                        "user_id": g.get("user_id"),
+                        "broker": broker_name,
+                        "symbol": request_data.get("symbol"),
+                        "order_type": api_type,
+                        "rtt_ms": rtt,
+                        "validation_latency_ms": tracker.stage_times.get("validation", 0),
+                        "response_latency_ms": tracker.stage_times.get("broker_response", 0),
+                        "overhead_ms": overhead,
+                        "total_latency_ms": total,
+                        "request_body": None,
+                        "response_body": None,
+                        "status": "SUCCESS" if status_code < 400 else "FAILED",
+                        "error": response_data.get("message") if status_code >= 400 else None,
                     },
-                    request_body=None,  # Not storing to save database space
-                    response_body=None,  # Not storing to save database space
-                    status="SUCCESS" if status_code < 400 else "FAILED",
-                    error=response_data.get("message") if status_code >= 400 else None,
                 )
 
                 return response
@@ -208,28 +210,26 @@ def track_latency(api_type):
                 if "request_data" in locals() and "apikey" in request_data:
                     broker_name = get_broker_name(request_data["apikey"])
 
-                OrderLatency.log_latency(
-                    order_id="error",
-                    user_id=g.get("user_id"),
-                    broker=broker_name,
-                    symbol=request_data.get("symbol") if "request_data" in locals() else None,
-                    order_type=api_type,
-                    latencies={
-                        "rtt": rtt,
-                        "validation": tracker.stage_times.get("validation", 0),
-                        "broker_response": 0,
-                        "overhead": overhead,
-                        "total": total_time,
+                async_log(
+                    OrderLatency,
+                    {
+                        "order_id": "error",
+                        "user_id": g.get("user_id"),
+                        "broker": broker_name,
+                        "symbol": request_data.get("symbol") if "request_data" in locals() else None,
+                        "order_type": api_type,
+                        "rtt_ms": rtt,
+                        "validation_latency_ms": tracker.stage_times.get("validation", 0),
+                        "response_latency_ms": 0,
+                        "overhead_ms": overhead,
+                        "total_latency_ms": total_time,
+                        "request_body": None,
+                        "response_body": None,
+                        "status": "FAILED",
+                        "error": str(e),
                     },
-                    request_body=None,  # Not storing to save database space
-                    response_body=None,  # Not storing to save database space
-                    status="FAILED",
-                    error=str(e),
                 )
                 raise
-
-            finally:
-                latency_session.remove()
 
         return wrapped
 
@@ -248,11 +248,18 @@ def wrap_resource_methods(resource_class, api_type):
 
 def init_latency_monitoring(app):
     """Initialize latency monitoring"""
-    # Initialize the latency database
-    init_latency_db()
+    # Initialize the latency database, but do not fail app startup if the
+    # remote database is temporarily unreachable.
+    try:
+        init_latency_db()
+    except Exception as e:
+        logger.exception(f"Latency DB init failed; continuing startup: {e}")
 
     # Auto-purge old data endpoint logs (keep order logs forever, purge data logs after 7 days)
-    purge_old_data_logs(days=7)
+    try:
+        purge_old_data_logs(days=7)
+    except Exception as e:
+        logger.exception(f"Latency data purge failed; continuing startup: {e}")
 
     # Import all RESTX API resources
     from restx_api import api

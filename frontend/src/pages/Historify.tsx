@@ -87,6 +87,7 @@ import { profileMenuItems } from '@/config/navigation'
 import { authApi } from '@/api/auth'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
+import { formatIstDateTime, shiftIstDate, todayIstIsoDate } from '@/utils/time'
 import { LogoutConfirmDialog } from '@/components/auth/LogoutConfirmDialog'
 
 // Types
@@ -241,9 +242,7 @@ const DATE_PRESETS = [
 ]
 
 function getDateFromPreset(months: number): string {
-  const d = new Date()
-  d.setMonth(d.getMonth() - months)
-  return d.toISOString().split('T')[0]
+  return shiftIstDate(0, -months)
 }
 
 export default function Historify() {
@@ -277,7 +276,7 @@ export default function Historify() {
   // Download settings
   const [selectedInterval, setSelectedInterval] = useState<string>('D')
   const [startDate, setStartDate] = useState(() => getDateFromPreset(1))
-  const [endDate, setEndDate] = useState(() => new Date().toISOString().split('T')[0])
+  const [endDate, setEndDate] = useState(() => todayIstIsoDate())
   const [incrementalDownload, setIncrementalDownload] = useState(false)
 
   // FNO Discovery state (disabled for now - will be added later)
@@ -1932,9 +1931,9 @@ export default function Historify() {
                                   "h-8 min-w-[3rem]",
                                   isSelected && "ring-2 ring-primary ring-offset-2 ring-offset-background"
                                 )}
-                                onClick={() => {
+                                  onClick={() => {
                                   setStartDate(getDateFromPreset(preset.months))
-                                  setEndDate(new Date().toISOString().split('T')[0])
+                                  setEndDate(todayIstIsoDate())
                                 }}
                               >
                                 {preset.label}
@@ -2133,7 +2132,11 @@ export default function Historify() {
                                   <Badge variant="outline">{item.exchange}</Badge>
                                 </TableCell>
                                 <TableCell className="hidden md:table-cell text-muted-foreground text-sm">
-                                  {new Date(item.added_at).toLocaleDateString()}
+                                  {formatIstDateTime(item.added_at, {
+                                    year: 'numeric',
+                                    month: 'short',
+                                    day: '2-digit',
+                                  })}
                                 </TableCell>
                                 <TableCell>
                                   <div className="flex items-center justify-end gap-1">
@@ -2329,10 +2332,10 @@ export default function Historify() {
                                 </p>
                                 <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
                                   {schedule.next_run_at && (
-                                    <span>Next: {new Date(schedule.next_run_at).toLocaleString()}</span>
+                                    <span>Next: {formatIstDateTime(schedule.next_run_at)}</span>
                                   )}
                                   {schedule.last_run_at && (
-                                    <span>Last: {new Date(schedule.last_run_at).toLocaleString()}</span>
+                                    <span>Last: {formatIstDateTime(schedule.last_run_at)}</span>
                                   )}
                                   <span>Runs: {schedule.total_runs} ({schedule.successful_runs} ok, {schedule.failed_runs} failed)</span>
                                 </div>
@@ -2428,7 +2431,7 @@ export default function Historify() {
                                       {scheduleExecutions[schedule.id].map((exec) => (
                                         <TableRow key={exec.id}>
                                           <TableCell className="text-sm">
-                                            {new Date(exec.started_at).toLocaleString()}
+                                            {formatIstDateTime(exec.started_at)}
                                           </TableCell>
                                           <TableCell>
                                             <Badge

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { nowIstIso, toIstIso } from '@/utils/time'
 import type { WebSocketMessage, LatencySample } from '@/types/websocket'
 
 // Fetch CSRF token for authenticated requests
@@ -298,11 +299,11 @@ export function useWebSocketTester(_apiKey?: string): UseWebSocketTesterReturn {
   // Export messages
   const exportMessages = useCallback(() => {
     const exportData = {
-      exportedAt: new Date().toISOString(),
+      exportedAt: nowIstIso(),
       totalMessages: messages.length,
       messages: messages.map((m) => ({
         ...m,
-        timestamp: new Date(m.timestamp).toISOString(),
+        timestamp: toIstIso(m.timestamp) || nowIstIso(),
       })),
     }
     const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' })

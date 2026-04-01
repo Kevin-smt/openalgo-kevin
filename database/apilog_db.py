@@ -3,44 +3,30 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 
-import pytz
-from sqlalchemy import Column, DateTime, Integer, Text, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy import Column, DateTime, Integer, Text
 from sqlalchemy.sql import func
 
+from database.db import Base, Session, engine
+from utils.async_db_logger import async_log
 from utils.logging import get_logger
+from utils.timezone import now_ist
 
 logger = get_logger(__name__)
 
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your SQLite path
+DATABASE_URL = os.getenv("DATABASE_URL")  # Resolved by the PostgreSQL env profile
 
-# Conditionally create engine based on DB type
-if DATABASE_URL and "sqlite" in DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    engine = create_engine(
-        DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    engine = create_engine(DATABASE_URL, pool_size=50, max_overflow=100, pool_timeout=10)
-
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+db_session = Session
 
 
 class OrderLog(Base):
     __tablename__ = "order_logs"
     id = Column(Integer, primary_key=True)
-    api_type = Column(Text, nullable=False)
+    api_type = Column(Text, nullable=False, index=True)
     request_data = Column(Text, nullable=False)
     response_data = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=func.now())
+    created_at = Column(DateTime(timezone=True), default=func.now(), index=True)
 
 
 def init_db():
@@ -56,22 +42,27 @@ executor = ThreadPoolExecutor(10)  # Increased from 2 to 10 for better concurren
 def async_log_order(api_type, request_data, response_data):
     try:
         # Serialize JSON data for storage
-        request_json = json.dumps(request_data)
-        response_json = json.dumps(response_data)
-
-        # Get current time in IST
-        ist = pytz.timezone("Asia/Kolkata")
-        now_ist = datetime.now(ist)
-
-        order_log = OrderLog(
-            api_type=api_type,
-            request_data=request_json,
-            response_data=response_json,
-            created_at=now_ist,
+        async_log(
+            OrderLog,
+            {
+                "api_type": api_type,
+                "request_data": json.dumps(request_data),
+                "response_data": json.dumps(response_data),
+                "created_at": now_ist(),
+            },
         )
-        db_session.add(order_log)
-        db_session.commit()
     except Exception as e:
-        logger.exception(f"Error saving order log: {e}")
-    finally:
-        db_session.remove()
+        logger.exception(f"Error queueing order log: {e}")
+        try:
+            order_log = OrderLog(
+                api_type=api_type,
+                request_data=json.dumps(request_data),
+                response_data=json.dumps(response_data),
+                created_at=now_ist(),
+            )
+            db_session.add(order_log)
+            db_session.commit()
+        except Exception as sync_error:
+            logger.exception(f"Error saving order log synchronously: {sync_error}")
+        finally:
+            db_session.remove()

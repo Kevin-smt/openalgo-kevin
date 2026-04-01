@@ -1,17 +1,16 @@
 # database/user_db.py
 
 import os
+from contextlib import contextmanager
 
 import pyotp
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from cachetools import TTLCache
-from sqlalchemy import Boolean, Column, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, Integer, String
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
 
+from database.db import Base, Session, SessionLocal, engine
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,20 +38,20 @@ if len(_pepper_value) < 32:
 PASSWORD_PEPPER = _pepper_value
 
 # Engine and session setup
-# Conditionally create engine based on DB type
-if DATABASE_URL and "sqlite" in DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    engine = create_engine(
-        DATABASE_URL, echo=False, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    engine = create_engine(
-        DATABASE_URL, echo=False, pool_size=50, max_overflow=100, pool_timeout=10
-    )
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+db_session = Session
+
+
+@contextmanager
+def _session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 # Define a cache for the usernames with a max size and a 30-second TTL
 username_cache = TTLCache(maxsize=1024, ttl=30)
@@ -61,8 +60,8 @@ username_cache = TTLCache(maxsize=1024, ttl=30)
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    username = Column(String(80), unique=True, nullable=False)
-    email = Column(String(120), unique=True, nullable=False)
+    username = Column(String(80), unique=True, nullable=False, index=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)  # Increased length for Argon2 hash
     totp_secret = Column(String(32), nullable=False)  # For TOTP-based password reset
     is_admin = Column(Boolean, default=False)
@@ -77,10 +76,6 @@ class User(Base):
         peppered_password = password + PASSWORD_PEPPER
         try:
             ph.verify(self.password_hash, peppered_password)
-            # Check if the hash needs to be updated
-            if ph.check_needs_rehash(self.password_hash):
-                self.set_password(password)
-                db_session.commit()
             return True
         except VerifyMismatchError:
             return False
@@ -105,15 +100,20 @@ def init_db():
 
 def add_user(username, email, password, is_admin=False):
     try:
-        # Generate TOTP secret for the user
-        totp_secret = pyotp.random_base32()
-        user = User(username=username, email=email, totp_secret=totp_secret, is_admin=is_admin)
-        user.set_password(password)
-        db_session.add(user)
-        db_session.commit()
-        return user  # Return the user object instead of True
+        with _session_scope() as session:
+            # Generate TOTP secret for the user
+            totp_secret = pyotp.random_base32()
+            user = User(
+                username=username,
+                email=email,
+                totp_secret=totp_secret,
+                is_admin=is_admin,
+            )
+            user.set_password(password)
+            session.add(user)
+            session.flush()
+            return user  # Return the user object instead of True
     except IntegrityError:
-        db_session.rollback()
         return None  # Return None instead of False
 
 
@@ -128,22 +128,32 @@ def authenticate_user(username, password):
         else:
             del username_cache[cache_key]  # Remove invalid cache entry
             return False
-    else:
-        user = User.query.filter_by(username=username).first()
-        if user and user.check_password(password):
-            username_cache[cache_key] = user  # Cache the User object
-            return True
-        return False
+    with _session_scope() as session:
+        user = session.query(User).filter_by(username=username).first()
+        if not user:
+            return False
+
+        if not user.check_password(password):
+            return False
+
+        if ph.check_needs_rehash(user.password_hash):
+            user.set_password(password)
+            session.add(user)
+
+        username_cache[cache_key] = user  # Cache the User object
+        return True
 
 
 def find_user_by_email(email):
     """Find user by email for password reset"""
-    return User.query.filter_by(email=email).first()
+    with SessionLocal() as session:
+        return session.query(User).filter_by(email=email).first()
 
 
 def find_user_by_username():
     """Find admin user"""
-    return User.query.filter_by(is_admin=True).first()
+    with SessionLocal() as session:
+        return session.query(User).filter_by(is_admin=True).first()
 
 
 def rehash_all_passwords():
@@ -152,12 +162,12 @@ def rehash_all_passwords():
     This should be called once when upgrading from the old hashing method.
     Requires knowing the original passwords or having users reset them.
     """
-    users = User.query.all()
-    for user in users:
-        if user.password_hash.startswith("pbkdf2:sha256"):  # Old Werkzeug format
-            # At this point, you would either:
-            # 1. Have users reset their passwords
-            # 2. Or if you have access to original passwords (during migration):
-            #    user.set_password(original_password)
-            pass
-    db_session.commit()
+    with _session_scope() as session:
+        users = session.query(User).all()
+        for user in users:
+            if user.password_hash.startswith("pbkdf2:sha256"):  # Old Werkzeug format
+                # At this point, you would either:
+                # 1. Have users reset their passwords
+                # 2. Or if you have access to original passwords (during migration):
+                #    user.set_password(original_password)
+                pass

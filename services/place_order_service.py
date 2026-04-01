@@ -1,12 +1,20 @@
 import copy
 import importlib
 import traceback
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
+from database.trading_db import (
+    _resolve_ledger_user_id,
+    mirror_live_order,
+    save_order,
+    save_order_event,
+)
 from events import AnalyzerErrorEvent, OrderFailedEvent, OrderPlacedEvent
 from restx_api.schemas import OrderSchema
+from utils.api_timer import APITimer
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -121,6 +129,9 @@ def place_order_with_auth(
     broker: str,
     original_data: dict[str, Any],
     emit_event: bool = True,
+    user_id: str | None = None,
+    analyze_mode: bool | None = None,
+    timer: APITimer | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order using provided auth token.
@@ -143,9 +154,22 @@ def place_order_with_auth(
         order_request_data.pop("apikey", None)
 
     api_key = original_data.get("apikey", "")
+    logger.info(
+        "[LEDGER DEBUG] place_order_with_auth entered: broker=%s symbol=%s user_id=%s api_key_present=%s",
+        broker,
+        order_data.get("symbol"),
+        user_id,
+        bool(api_key),
+    )
+
+    if timer:
+        timer.checkpoint("symbol_lookup_db")
 
     # If in analyze mode, route to sandbox for virtual trading
-    if get_analyze_mode():
+    if analyze_mode is None:
+        analyze_mode = get_analyze_mode()
+
+    if analyze_mode:
         from services.sandbox_service import sandbox_place_order
 
         if not api_key:
@@ -194,6 +218,8 @@ def place_order_with_auth(
         return False, error_response, 404
 
     try:
+        if timer:
+            timer.checkpoint("broker_api_call")
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
     except Exception as e:
         logger.error(f"Error in broker_module.place_order_api: {e}")
@@ -215,7 +241,15 @@ def place_order_with_auth(
         return False, error_response, 500
 
     if res.status == 200:
+        if timer:
+            timer.checkpoint("dedup_check_db")
         order_response_data = {"status": "success", "orderid": order_id}
+        resolved_user_id = _resolve_ledger_user_id(user_id=user_id, api_key=api_key)
+        logger.info(
+            "[LEDGER DEBUG] place_order success branch: resolved_user_id=%s broker_order_id=%s",
+            resolved_user_id,
+            order_id,
+        )
 
         if emit_event:
             bus.publish(OrderPlacedEvent(
@@ -233,6 +267,36 @@ def place_order_with_auth(
                 response_data=order_response_data,
                 api_key=api_key,
             ))
+
+        logger.info(
+            f"[LEDGER DEBUG] Attempting mirror_live_order for user={resolved_user_id}, broker={broker}, "
+            f"symbol={order_data.get('symbol')}, orderid={order_id}"
+        )
+        if timer:
+            timer.checkpoint("order_write_db")
+        mirrored = mirror_live_order(
+            order_data=order_data,
+            broker=broker,
+            api_key=api_key,
+            broker_order_id=str(order_id),
+            order_status="open",
+            broker_response=response_data if isinstance(response_data, dict) else {"status": "success"},
+            user_id=resolved_user_id,
+            api_source="placeorder",
+        )
+        if mirrored is False:
+            logger.warning("[LEDGER DEBUG] mirror_live_order did not persist the order")
+        else:
+            logger.info("[LEDGER DEBUG] mirror_live_order completed successfully")
+
+        # Immediately refresh mirrored live-trading state so trades/positions/holdings
+        # are persisted right after a successful broker execution.
+        try:
+            from services.trading_sync_service import sync_live_trading_state
+
+            sync_live_trading_state(api_key, reason="placeorder")
+        except Exception as exc:
+            logger.warning(f"[LEDGER DEBUG] live trading sync after placeorder failed: {exc}")
 
         return True, order_response_data, 200
     else:
@@ -252,6 +316,36 @@ def place_order_with_auth(
             exchange=order_data.get("exchange", ""),
             error_message=message,
         ))
+
+        rejected_broker_order_id = None
+        if isinstance(response_data, dict):
+            rejected_broker_order_id = response_data.get("orderid")
+        logger.info(
+            "[LEDGER DEBUG] place_order rejection branch: resolved_user_id=%s broker_order_id=%s message=%s",
+            _resolve_ledger_user_id(user_id=user_id, api_key=api_key),
+            rejected_broker_order_id,
+            message,
+        )
+
+        logger.info(
+            f"[LEDGER DEBUG] Attempting mirror_live_order for rejected order user={_resolve_ledger_user_id(user_id=user_id, api_key=api_key)}, "
+            f"broker={broker}, symbol={order_data.get('symbol')}, orderid={rejected_broker_order_id}"
+        )
+        mirrored = mirror_live_order(
+            order_data=order_data,
+            broker=broker,
+            api_key=api_key,
+            broker_order_id=str(rejected_broker_order_id) if rejected_broker_order_id else None,
+            order_status="rejected",
+            broker_response=response_data if isinstance(response_data, dict) else error_response,
+            rejection_reason=message,
+            user_id=_resolve_ledger_user_id(user_id=user_id, api_key=api_key),
+            api_source="placeorder",
+        )
+        if mirrored is False:
+            logger.warning("[LEDGER DEBUG] mirror_live_order did not persist the rejected order")
+        else:
+            logger.info("[LEDGER DEBUG] mirror_live_order completed successfully")
         return False, error_response, res.status if res.status != 200 else 500
 
 
@@ -261,6 +355,9 @@ def place_order(
     auth_token: str | None = None,
     broker: str | None = None,
     emit_event: bool = True,
+    user_id: str | None = None,
+    analyze_mode: bool | None = None,
+    timer: APITimer | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order with the broker.
@@ -318,11 +415,29 @@ def place_order(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        return place_order_with_auth(order_data, AUTH_TOKEN, broker_name, original_data, emit_event)
+        return place_order_with_auth(
+            order_data,
+            AUTH_TOKEN,
+            broker_name,
+            original_data,
+            emit_event,
+            user_id=user_id,
+            analyze_mode=analyze_mode,
+            timer=timer,
+        )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return place_order_with_auth(order_data, auth_token, broker, original_data, emit_event)
+        return place_order_with_auth(
+            order_data,
+            auth_token,
+            broker,
+            original_data,
+            emit_event,
+            user_id=user_id,
+            analyze_mode=analyze_mode,
+            timer=timer,
+        )
 
     # Case 3: Invalid parameters
     else:

@@ -5,13 +5,14 @@ from io import StringIO
 
 import pandas as pd
 import requests
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.auth_db import get_auth_token
 from extensions import socketio
 from utils.logging import get_logger
+from utils.database_config import bulk_insert_mappings_chunked, get_engine
 
 logger = get_logger(__name__)
 
@@ -19,7 +20,7 @@ logger = get_logger(__name__)
 # DATABASE SETUP
 # -------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL)
+engine = get_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -62,139 +63,29 @@ def delete_symtoken_table():
 
 
 def copy_from_dataframe(df):
-    """Bulk insert DataFrame records into the symtoken table."""
-    logger.info("Performing Bulk Insert into SymToken Table")
-
+    logger.info("Performing Bulk Insert")
+    # Convert DataFrame to a list of dictionaries
     data_dict = df.to_dict(orient="records")
+
+    # Retrieve existing tokens to filter them out from the insert
     existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
-    filtered_data_dict = [
-        row for row in data_dict if row.get("token") and str(row["token"]) not in existing_tokens
-    ]
-
-    try:
-        if filtered_data_dict:
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
-            db_session.commit()
-            logger.info(f"Inserted {len(filtered_data_dict)} new records successfully.")
-        else:
-            logger.info("No new MStock records to insert.")
-    except Exception as e:
-        logger.error(f"Error during MStock bulk insert: {e}")
-        db_session.rollback()
-
-
-# -------------------------------------------------------------------
-# MStock Master Contract Fetch
-# -------------------------------------------------------------------
-def download_mstock_csv(auth_token):
-    """
-    Download the MStock master contract CSV from the API using Type B authentication.
-    """
-    api_key = os.getenv("BROKER_API_SECRET")
-    url = "https://api.mstock.trade/openapi/typeb/instruments/OpenAPIScripMaster"
-
-    headers = {
-        "X-Mirae-Version": "1",
-        "Authorization": f"Bearer {auth_token}",
-        "X-PrivateKey": api_key,
-    }
-
-    logger.info(f"Fetching MStock master contract from {url}")
+    # Filter out data_dict entries with tokens that already exist
+    filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
     try:
-        response = requests.get(url, headers=headers, timeout=60)
-        logger.info(f"MStock master contract download status: {response.status_code}")
-
-        if response.status_code != 200:
-            logger.error(f"Failed to download MStock master contract: {response.status_code}")
-            logger.error(f"Response: {response.text}")
-            return None
-
-        # Type B API returns JSON array, not CSV
-        return response.json()
-
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "500")),
+            logger=logger,
+            label="Master contract",
+        )
     except Exception as e:
-        logger.error(f"Error fetching MStock master contract: {e}")
-        return None
-
-
-# -------------------------------------------------------------------
-# DATE CONVERSION HELPER
-# -------------------------------------------------------------------
-def convert_date(date_str):
-    """
-    Convert date format to OpenAlgo expiry column format: DD-MMM-YY (with hyphens).
-    Example: '19MAR2024' -> '19-MAR-24' or '2024-03-19' -> '19-MAR-24'
-
-    OpenAlgo Expiry Column Format: DD-MMM-YY (e.g., 28-MAR-24, 25-APR-24)
-    Note: This is for the expiry column. Symbols use DDMMMYY without hyphens.
-    """
-    if pd.isna(date_str) or date_str == "" or str(date_str).strip() == "":
-        return ""
-
-    try:
-        date_str = str(date_str).strip()
-
-        # If already in correct format DD-MMM-YY, return as is
-        if len(date_str) == 9 and date_str[2] == "-" and date_str[6] == "-":
-            return date_str.upper()
-
-        # Try format: 19MAR2024 or 19-MAR-2024 (with 4-digit year)
-        if len(date_str) >= 9:
-            try:
-                parsed_date = datetime.strptime(date_str.replace("-", ""), "%d%b%Y")
-                return parsed_date.strftime("%d-%b-%y").upper()  # DD-MMM-YY with hyphens
-            except ValueError:
-                pass
-
-        # Try ISO format: 2024-03-19
-        try:
-            parsed_date = datetime.strptime(date_str, "%Y-%m-%d")
-            return parsed_date.strftime("%d-%b-%y").upper()  # DD-MMM-YY with hyphens
-        except ValueError:
-            pass
-
-        # Try format with hyphens: 19-MAR-24 (2-digit year)
-        try:
-            parsed_date = datetime.strptime(date_str, "%d-%b-%y")
-            return parsed_date.strftime("%d-%b-%y").upper()  # DD-MMM-YY with hyphens
-        except ValueError:
-            pass
-
-        # Try format: 19MAR24 (without hyphens, 2-digit year)
-        if len(date_str) == 7:
-            try:
-                parsed_date = datetime.strptime(date_str, "%d%b%y")
-                return parsed_date.strftime("%d-%b-%y").upper()  # DD-MMM-YY with hyphens
-            except ValueError:
-                pass
-
-        # Try format without year: 19-MAR or 19MAR (add current year)
-        if len(date_str) in [6, 7] and date_str.replace("-", "").isalnum():
-            try:
-                # Add current year
-                current_year = datetime.now().year
-                date_with_year = f"{date_str}{current_year}"
-                parsed_date = datetime.strptime(date_with_year.replace("-", ""), "%d%b%Y")
-                return parsed_date.strftime("%d-%b-%y").upper()
-            except ValueError:
-                pass
-
-        # Log warning for unparseable date
-        logger.warning(f"Could not parse date format: '{date_str}' (length: {len(date_str)})")
-
-        # Return original if no format matched (with hyphens added if missing)
-        if "-" not in date_str and len(date_str) >= 7:
-            # Try to add hyphens: 25DEC24 -> 25-DEC-24
-            return f"{date_str[:2]}-{date_str[2:5]}-{date_str[5:]}".upper()
-
-        return date_str.upper()
-
-    except Exception as e:
-        logger.error(f"Error parsing date '{date_str}': {e}")
-        return str(date_str)
-
+        logger.exception(f"Error during bulk insert: {e}")
+        raise
 
 def fetch_and_process_mstock_indices():
     """

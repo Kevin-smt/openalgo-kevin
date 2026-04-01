@@ -223,17 +223,18 @@ if [ -d "$OPENALGO_PATH/db" ]; then
     fi
 
     # Backup SQLite databases
-    for db_file in openalgo.db logs.db latency.db sandbox.db; do
-        if [ -f "$OPENALGO_PATH/db/$db_file" ]; then
-            if [ "$SERVER_MODE" = true ]; then
-                sudo cp "$OPENALGO_PATH/db/$db_file" "$BACKUP_DIR/$db_file"
-            else
-                cp "$OPENALGO_PATH/db/$db_file" "$BACKUP_DIR/$db_file"
-            fi
-            log_message "  Backed up: $db_file" "$GREEN"
-            BACKUP_COUNT=$((BACKUP_COUNT + 1))
-        fi
-    done
+    # Not required - PostgreSQL is now used
+    # for db_file in openalgo.db logs.db latency.db sandbox.db; do
+    #     if [ -f "$OPENALGO_PATH/db/$db_file" ]; then
+    #         if [ "$SERVER_MODE" = true ]; then
+    #             sudo cp "$OPENALGO_PATH/db/$db_file" "$BACKUP_DIR/$db_file"
+    #         else
+    #             cp "$OPENALGO_PATH/db/$db_file" "$BACKUP_DIR/$db_file"
+    #         fi
+    #         log_message "  Backed up: $db_file" "$GREEN"
+    #         BACKUP_COUNT=$((BACKUP_COUNT + 1))
+    #     fi
+    # done
 
     # Backup DuckDB database
     if [ -f "$OPENALGO_PATH/db/historify.duckdb" ]; then

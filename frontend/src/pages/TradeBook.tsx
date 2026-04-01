@@ -26,6 +26,7 @@ import {
 import { cn, makeFormatCurrency, sanitizeCSV } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 import { onModeChange } from '@/stores/themeStore'
+import { formatIstDateTimeFromUtc, todayIstIsoDate } from '@/utils/time'
 import type { Trade } from '@/types/trading'
 
 interface FilterState {
@@ -35,15 +36,7 @@ interface FilterState {
 }
 
 function formatTime(timestamp: string): string {
-  try {
-    return new Date(timestamp).toLocaleTimeString('en-IN', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    })
-  } catch {
-    return timestamp
-  }
+  return formatIstDateTimeFromUtc(timestamp, { timeZoneName: 'short' })
 }
 
 export default function TradeBook() {
@@ -166,7 +159,7 @@ export default function TradeBook() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      const filename = `tradebook_${new Date().toISOString().split('T')[0]}.csv`
+      const filename = `tradebook_${todayIstIsoDate()}.csv`
       a.download = filename
       a.click()
       URL.revokeObjectURL(url)

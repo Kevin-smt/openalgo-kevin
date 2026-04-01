@@ -6,20 +6,21 @@ from io import StringIO
 import httpx
 import numpy as np
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.database_config import bulk_insert_mappings_chunked, get_engine
 
 logger = get_logger(__name__)
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = get_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -62,27 +63,21 @@ def copy_from_dataframe(df):
 
     # Retrieve existing tokens to filter them out from the insert
     existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
     # Filter out data_dict entries with tokens that already exist
     filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in batches to avoid memory spikes and SQLite locking
-    BATCH_SIZE = 10000
     try:
-        if filtered_data_dict:
-            total = len(filtered_data_dict)
-            logger.info(f"Inserting {total} new records into the database in batches of {BATCH_SIZE}")
-            for i in range(0, total, BATCH_SIZE):
-                batch = filtered_data_dict[i : i + BATCH_SIZE]
-                db_session.bulk_insert_mappings(SymToken, batch)
-                db_session.flush()
-                logger.info(f"Inserted batch {i // BATCH_SIZE + 1} ({min(i + BATCH_SIZE, total)}/{total} records)")
-            db_session.commit()
-            logger.info(f"Bulk insert completed successfully with {total} new records.")
-        else:
-            logger.info("No new records to insert")
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            filtered_data_dict,
+            chunk_size=500,
+            logger=logger,
+            label="Groww master contract",
+        )
     except Exception as e:
-        db_session.rollback()
         logger.error(f"Error during bulk insert: {e}")
         raise
 

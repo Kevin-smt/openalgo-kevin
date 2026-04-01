@@ -8,14 +8,57 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import lru_cache
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
+from sqlalchemy import inspect
 
 from utils.constants import CRYPTO_EXCHANGES, FNO_EXCHANGES
 from utils.logging import get_logger
+from database.db import SessionLocal, engine
 
 logger = get_logger(__name__)
+_SYM_TOKEN_SCHEMA_READY = False
+
+
+@contextmanager
+def _symbol_session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _ensure_symtoken_table() -> bool:
+    """Create symtoken tables on demand if they are missing."""
+    global _SYM_TOKEN_SCHEMA_READY
+    if _SYM_TOKEN_SCHEMA_READY:
+        return True
+
+    try:
+        if inspect(engine).has_table("symtoken"):
+            _SYM_TOKEN_SCHEMA_READY = True
+            return True
+    except Exception as exc:
+        logger.debug(f"Could not inspect symtoken table; will try to initialize it: {exc}")
+
+    try:
+        from database.symbol import init_db as init_master_contract_db
+
+        init_master_contract_db()
+        _SYM_TOKEN_SCHEMA_READY = True
+        logger.info("Created missing symtoken table(s) via master contract DB init")
+        return True
+    except Exception as exc:
+        logger.exception(f"Failed to create missing symtoken table(s): {exc}")
+        return False
 
 # Regex pattern to extract underlying from OpenAlgo symbol format
 # Format: [BaseSymbol][DDMMMYY][StrikePrice][CE/PE] or [BaseSymbol][DDMMMYY]FUT
@@ -175,8 +218,11 @@ class BrokerSymbolCache:
         Load all symbols for the active broker into memory
         This is called once after master contract download
         """
+        db_session = None
         try:
-            from database.symbol import SymToken
+            if not _ensure_symtoken_table():
+                return False
+            from database.symbol import SymToken, db_session
 
             start_time = time.time()
             logger.debug(f"Loading all symbols for broker: {broker}")
@@ -184,64 +230,83 @@ class BrokerSymbolCache:
             # Clear existing cache
             self.clear_cache()
 
-            # Query all symbols from database
-            symbols = SymToken.query.all()
-
-            if not symbols:
-                logger.warning(f"No symbols found in database for broker: {broker}")
-                return False
-
-            # Build in-memory structures
-            for sym in symbols:
-                # Extract underlying from OpenAlgo symbol format for FNO exchanges
-                underlying = None
-                if sym.exchange in FNO_EXCHANGES:
-                    underlying = extract_underlying_from_symbol(sym.symbol, sym.exchange)
-
-                # Create lightweight data object
-                symbol_data = SymbolData(
-                    symbol=sym.symbol,
-                    brsymbol=sym.brsymbol,
-                    name=sym.name,
-                    exchange=sym.exchange,
-                    brexchange=sym.brexchange,
-                    token=sym.token,
-                    expiry=sym.expiry,
-                    strike=sym.strike,
-                    lotsize=sym.lotsize,
-                    instrumenttype=sym.instrumenttype,
-                    tick_size=sym.tick_size,
-                    underlying=underlying,
-                    contract_value=getattr(sym, 'contract_value', None),
+            with _symbol_session_scope() as session:
+                symbol_rows = (
+                    session.query(
+                        SymToken.symbol,
+                        SymToken.brsymbol,
+                        SymToken.name,
+                        SymToken.exchange,
+                        SymToken.brexchange,
+                        SymToken.token,
+                        SymToken.expiry,
+                        SymToken.strike,
+                        SymToken.lotsize,
+                        SymToken.instrumenttype,
+                        SymToken.tick_size,
+                    )
+                    .yield_per(5000)
                 )
 
-                # Store in primary dict
-                self.symbols[sym.token] = symbol_data
+                row_count = 0
+                for row in symbol_rows:
+                    row_count += 1
+                    if row_count % 25000 == 0:
+                        logger.info(f"Loaded {row_count} symbols into cache for broker: {broker}")
 
-                # Build indexes
-                self.by_symbol_exchange[(sym.symbol, sym.exchange)] = symbol_data
-                self.by_token_exchange[(sym.token, sym.exchange)] = symbol_data
-                self.by_brsymbol_exchange[(sym.brsymbol, sym.exchange)] = symbol_data
-                self.by_token[sym.token] = symbol_data
+                    # Extract underlying from OpenAlgo symbol format for FNO exchanges
+                    underlying = None
+                    if row.exchange in FNO_EXCHANGES:
+                        underlying = extract_underlying_from_symbol(row.symbol, row.exchange)
 
-                # Build FNO filter indexes for O(1) lookups
-                self.by_exchange[sym.exchange].append(symbol_data)
-                if sym.expiry:
-                    self.expiries_by_exchange[sym.exchange].add(sym.expiry)
-                    # Use extracted underlying for index (more reliable than broker's name field)
-                    if underlying:
-                        self.expiries_by_exchange_underlying[(sym.exchange, underlying)].add(sym.expiry)
-                # Use extracted underlying for underlyings index.
-                # Only track underlyings that have options (CE/PE) — perpetuals, futures,
-                # spreads, etc. should not appear in the option-chain/IV-chart dropdown.
-                sym_upper = sym.symbol.upper()
-                if underlying and (sym_upper.endswith("CE") or sym_upper.endswith("PE")):
-                    self.underlyings_by_exchange[sym.exchange].add(underlying)
+                    # Create lightweight data object
+                    symbol_data = SymbolData(
+                        symbol=row.symbol,
+                        brsymbol=row.brsymbol,
+                        name=row.name,
+                        exchange=row.exchange,
+                        brexchange=row.brexchange,
+                        token=row.token,
+                        expiry=row.expiry,
+                        strike=row.strike,
+                        lotsize=row.lotsize,
+                        instrumenttype=row.instrumenttype,
+                        tick_size=row.tick_size,
+                        underlying=underlying,
+                        contract_value=None,
+                    )
+
+                    # Store in primary dict
+                    self.symbols[row.token] = symbol_data
+
+                    # Build indexes
+                    self.by_symbol_exchange[(row.symbol, row.exchange)] = symbol_data
+                    self.by_token_exchange[(row.token, row.exchange)] = symbol_data
+                    self.by_brsymbol_exchange[(row.brsymbol, row.exchange)] = symbol_data
+                    self.by_token[row.token] = symbol_data
+
+                    # Build FNO filter indexes for O(1) lookups
+                    self.by_exchange[row.exchange].append(symbol_data)
+                    if row.expiry:
+                        self.expiries_by_exchange[row.exchange].add(row.expiry)
+                        # Use extracted underlying for index (more reliable than broker's name field)
+                        if underlying:
+                            self.expiries_by_exchange_underlying[(row.exchange, underlying)].add(row.expiry)
+                    # Use extracted underlying for underlyings index.
+                    # Only track underlyings that have options (CE/PE) — perpetuals, futures,
+                    # spreads, etc. should not appear in the option-chain/IV-chart dropdown.
+                    sym_upper = row.symbol.upper()
+                    if underlying and (sym_upper.endswith("CE") or sym_upper.endswith("PE")):
+                        self.underlyings_by_exchange[row.exchange].add(underlying)
+
+                if row_count == 0:
+                    logger.warning(f"No symbols found in database for broker: {broker}")
+                    return False
 
             # Update cache metadata
             self.active_broker = broker
             self.cache_loaded = True
-            self.stats.total_symbols = len(symbols)
+            self.stats.total_symbols = row_count
             self.stats.cache_loads += 1
             self.stats.last_loaded = datetime.now(pytz.timezone("Asia/Kolkata"))
 
@@ -265,6 +330,12 @@ class BrokerSymbolCache:
         except Exception as e:
             logger.exception(f"Error loading symbols into cache: {e}")
             return False
+        finally:
+            if db_session is not None:
+                try:
+                    db_session.remove()
+                except Exception:
+                    pass
 
     def _set_session_timing(self):
         """Set session start and next reset time from SESSION_EXPIRY_TIME env variable"""
@@ -756,103 +827,121 @@ def get_symbol_info(symbol: str, exchange: str) -> SymbolData | None:
 
 
 # Database fallback functions (imported from original token_db)
+@lru_cache(maxsize=10000)
 def get_token_dbquery(symbol: str, exchange: str) -> str | None:
     """Query database for token by symbol and exchange"""
     try:
+        if not _ensure_symtoken_table():
+            return None
         from database.symbol import SymToken
 
-        sym_token = SymToken.query.filter_by(symbol=symbol, exchange=exchange).first()
-        if sym_token:
-            return sym_token.token
-        else:
+        with _symbol_session_scope() as session:
+            sym_token = session.query(SymToken).filter_by(symbol=symbol, exchange=exchange).first()
+            if sym_token:
+                return sym_token.token
             return None
     except Exception as e:
         logger.exception(f"Error while querying the database: {e}")
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_symbol_dbquery(token: str, exchange: str) -> str | None:
     """Query database for symbol by token and exchange"""
     try:
+        if not _ensure_symtoken_table():
+            return None
         from database.symbol import SymToken
 
-        sym_token = SymToken.query.filter_by(token=token, exchange=exchange).first()
-        if sym_token:
-            return sym_token.symbol
-        else:
+        with _symbol_session_scope() as session:
+            sym_token = session.query(SymToken).filter_by(token=token, exchange=exchange).first()
+            if sym_token:
+                return sym_token.symbol
             return None
     except Exception as e:
         logger.exception(f"Error while querying the database: {e}")
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_br_symbol_dbquery(symbol: str, exchange: str) -> str | None:
     """Query database for broker symbol"""
     try:
+        if not _ensure_symtoken_table():
+            return None
         from database.symbol import SymToken
 
-        sym_token = SymToken.query.filter_by(symbol=symbol, exchange=exchange).first()
-        if sym_token:
-            return sym_token.brsymbol
-        else:
+        with _symbol_session_scope() as session:
+            sym_token = session.query(SymToken).filter_by(symbol=symbol, exchange=exchange).first()
+            if sym_token:
+                return sym_token.brsymbol
             return None
     except Exception as e:
         logger.exception(f"Error while querying the database: {e}")
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_oa_symbol_dbquery(brsymbol: str, exchange: str) -> str | None:
     """Query database for OpenAlgo symbol"""
     try:
+        if not _ensure_symtoken_table():
+            return None
         from database.symbol import SymToken
 
-        sym_token = SymToken.query.filter_by(brsymbol=brsymbol, exchange=exchange).first()
-        if sym_token:
-            return sym_token.symbol
-        else:
+        with _symbol_session_scope() as session:
+            sym_token = session.query(SymToken).filter_by(brsymbol=brsymbol, exchange=exchange).first()
+            if sym_token:
+                return sym_token.symbol
             return None
     except Exception as e:
         logger.exception(f"Error while querying the database: {e}")
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_brexchange_dbquery(symbol: str, exchange: str) -> str | None:
     """Query database for broker exchange"""
     try:
+        if not _ensure_symtoken_table():
+            return None
         from database.symbol import SymToken
 
-        sym_token = SymToken.query.filter_by(symbol=symbol, exchange=exchange).first()
-        if sym_token:
-            return sym_token.brexchange
-        else:
+        with _symbol_session_scope() as session:
+            sym_token = session.query(SymToken).filter_by(symbol=symbol, exchange=exchange).first()
+            if sym_token:
+                return sym_token.brexchange
             return None
     except Exception as e:
         logger.exception(f"Error while querying the database: {e}")
         return None
 
 
+@lru_cache(maxsize=10000)
 def get_symbol_info_dbquery(symbol: str, exchange: str) -> SymbolData | None:
     """Query database for full symbol information, returns SymbolData object"""
     try:
+        if not _ensure_symtoken_table():
+            return None
         from database.symbol import SymToken
 
-        sym_token = SymToken.query.filter_by(symbol=symbol, exchange=exchange).first()
-        if sym_token:
-            # Convert SymToken database object to SymbolData
-            return SymbolData(
-                symbol=sym_token.symbol,
-                brsymbol=sym_token.brsymbol,
-                name=sym_token.name,
-                exchange=sym_token.exchange,
-                brexchange=sym_token.brexchange,
-                token=sym_token.token,
-                expiry=sym_token.expiry,
-                strike=sym_token.strike,
-                lotsize=sym_token.lotsize,
-                instrumenttype=sym_token.instrumenttype,
-                tick_size=sym_token.tick_size,
-            )
-        else:
+        with _symbol_session_scope() as session:
+            sym_token = session.query(SymToken).filter_by(symbol=symbol, exchange=exchange).first()
+            if sym_token:
+                # Convert SymToken database object to SymbolData
+                return SymbolData(
+                    symbol=sym_token.symbol,
+                    brsymbol=sym_token.brsymbol,
+                    name=sym_token.name,
+                    exchange=sym_token.exchange,
+                    brexchange=sym_token.brexchange,
+                    token=sym_token.token,
+                    expiry=sym_token.expiry,
+                    strike=sym_token.strike,
+                    lotsize=sym_token.lotsize,
+                    instrumenttype=sym_token.instrumenttype,
+                    tick_size=sym_token.tick_size,
+                )
             return None
     except Exception as e:
         logger.exception(f"Error while querying the database: {e}")
@@ -862,10 +951,12 @@ def get_symbol_info_dbquery(symbol: str, exchange: str) -> SymbolData | None:
 def get_symbol_count() -> int:
     """Get the total count of symbols in the database"""
     try:
+        if not _ensure_symtoken_table():
+            return 0
         from database.symbol import SymToken
 
-        count = SymToken.query.count()
-        return count
+        with _symbol_session_scope() as session:
+            return session.query(SymToken).count()
     except Exception as e:
         logger.exception(f"Error while counting symbols: {e}")
         return 0
@@ -885,12 +976,23 @@ def clear_cache():
     """Clear the cache - useful for manual refresh"""
     cache = get_cache()
     cache.clear_cache()
+    clear_symbol_query_caches()
 
 
 def get_cache_stats() -> dict:
     """Get cache statistics for monitoring"""
     cache = get_cache()
     return cache.get_cache_info()
+
+
+def clear_symbol_query_caches() -> None:
+    """Clear cached database fallback lookups when master contracts refresh."""
+    get_token_dbquery.cache_clear()
+    get_symbol_dbquery.cache_clear()
+    get_br_symbol_dbquery.cache_clear()
+    get_oa_symbol_dbquery.cache_clear()
+    get_brexchange_dbquery.cache_clear()
+    get_symbol_info_dbquery.cache_clear()
 
 
 # Bulk operations for performance

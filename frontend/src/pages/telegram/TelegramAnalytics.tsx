@@ -5,6 +5,7 @@ import { showToast } from '@/utils/toast'
 import { webClient } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { formatIstDateTime } from '@/utils/time'
 import {
   Table,
   TableBody,
@@ -53,7 +54,7 @@ export default function TelegramAnalytics() {
 
   const formatDate = (dateString: string | null) => {
     if (!dateString) return '-'
-    return new Date(dateString).toLocaleString()
+    return formatIstDateTime(dateString)
   }
 
   if (isLoading) {

@@ -4,20 +4,21 @@ import os
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import Column, Float, Index, Integer, Sequence, String, create_engine
+from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from extensions import socketio  # Import SocketIO
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.database_config import bulk_insert_mappings_chunked, get_engine
 
 logger = get_logger(__name__)
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Replace with your database path
 
-engine = create_engine(DATABASE_URL)
+engine = get_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
@@ -60,49 +61,48 @@ def copy_from_dataframe(df):
 
     # Retrieve existing tokens to filter them out from the insert
     existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
+    db_session.remove()
 
     # Filter out data_dict entries with tokens that already exist
     filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
 
-    # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            # Pre-validate records before insertion
-            invalid_records = []
-            valid_records = []
+        # Pre-validate records before insertion
+        invalid_records = []
+        valid_records = []
 
-            for record in filtered_data_dict:
-                # Allow indices ("I") even if symbol is missing
-                if record.get("instrumenttype") == "I":
-                    valid_records.append(record)
+        for record in filtered_data_dict:
+            # Allow indices ("I") even if symbol is missing
+            if record.get("instrumenttype") == "I":
+                valid_records.append(record)
+            else:
+                # Check if symbol exists and is not empty/null
+                symbol = record.get("symbol")
+                if not symbol or pd.isna(symbol) or str(symbol).strip() == "":
+                    invalid_records.append(record)
+                    logger.error(f"Schema validation failed for record: {record}")
+                    logger.debug("Symbol is missing, empty, or null")
                 else:
-                    # Check if symbol exists and is not empty/null
-                    symbol = record.get("symbol")
-                    if not symbol or pd.isna(symbol) or str(symbol).strip() == "":
-                        invalid_records.append(record)
-                        logger.error(f"Schema validation failed for record: {record}")
-                        logger.debug("Symbol is missing, empty, or null")
-                    else:
-                        valid_records.append(record)
+                    valid_records.append(record)
 
-            if valid_records:
-                db_session.bulk_insert_mappings(SymToken, valid_records)
-                db_session.commit()
-                logger.info(
-                    f"Bulk insert completed successfully with {len(valid_records)} new records."
-                )
+        bulk_insert_mappings_chunked(
+            engine,
+            SymToken,
+            valid_records,
+            chunk_size=int(os.getenv("MASTER_CONTRACT_INSERT_CHUNK_SIZE", "500")),
+            logger=logger,
+            label="Paytm master contract",
+        )
 
-            if invalid_records:
-                logger.warning(
-                    f"{len(invalid_records)} records failed schema validation and were skipped."
-                )
-        else:
-            logger.info("No new records to insert.")
+        if invalid_records:
+            logger.warning(
+                f"{len(invalid_records)} records failed schema validation and were skipped."
+            )
     except Exception as e:
         logger.exception(f"Error during bulk insert: {e}")
         if hasattr(e, "__cause__"):
             logger.error(f"Caused by: {e.__cause__}")
-        db_session.rollback()
+        raise
 
 
 def download_csv_paytm_data(output_path):

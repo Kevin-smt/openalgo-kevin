@@ -35,6 +35,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
+import { formatIstDateTime } from '@/utils/time'
 import type { CommandStats, TelegramUser } from '@/types/telegram'
 
 export default function TelegramUsers() {
@@ -147,7 +148,7 @@ export default function TelegramUsers() {
 
   const formatDate = (dateString: string | null) => {
     if (!dateString) return '-'
-    return new Date(dateString).toLocaleString()
+    return formatIstDateTime(dateString)
   }
 
   if (isLoading) {

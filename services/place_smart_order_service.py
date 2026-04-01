@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
+from database.trading_db import _resolve_ledger_user_id, mirror_live_order
 from events import (
     AnalyzerErrorEvent,
     OrderFailedEvent,
@@ -239,6 +240,7 @@ def place_smart_order_with_auth(
         # Log successful order immediately after placement
         if res and res.status == 200:
             order_response_data = {"status": "success", "orderid": order_id}
+            resolved_user_id = _resolve_ledger_user_id(api_key=api_key)
             bus.publish(OrderPlacedEvent(
                 mode="live", api_type="placesmartorder",
                 strategy=order_data.get("strategy", ""),
@@ -252,6 +254,24 @@ def place_smart_order_with_auth(
                 request_data=order_request_data, response_data=order_response_data,
                 api_key=api_key,
             ))
+            mirror_live_order(
+                order_data=order_data,
+                broker=broker,
+                api_key=api_key,
+                broker_order_id=str(order_id),
+                order_status="open",
+                broker_response=response_data if isinstance(response_data, dict) else {"status": "success"},
+                user_id=resolved_user_id,
+                api_source="placesmartorder",
+            )
+            try:
+                from services.trading_sync_service import sync_live_trading_state
+
+                sync_live_trading_state(api_key, reason="placesmartorder")
+            except Exception as exc:
+                logger.warning(
+                    f"[LEDGER DEBUG] live trading sync after placesmartorder failed: {exc}"
+                )
 
     except Exception as e:
         logger.error(f"Error in broker_module.place_smartorder_api: {e}")
@@ -288,6 +308,25 @@ def place_smart_order_with_auth(
             request_data=order_request_data, response_data=error_response,
             api_key=api_key, error_message=message,
         ))
+        mirror_live_order(
+            order_data=order_data,
+            broker=broker,
+            api_key=api_key,
+            broker_order_id=str(order_id) if order_id else None,
+            order_status="rejected",
+            broker_response=response_data if isinstance(response_data, dict) else error_response,
+            rejection_reason=message,
+            user_id=_resolve_ledger_user_id(api_key=api_key),
+            api_source="placesmartorder",
+        )
+        try:
+            from services.trading_sync_service import sync_live_trading_state
+
+            sync_live_trading_state(api_key, reason="placesmartorder_rejected")
+        except Exception as exc:
+            logger.warning(
+                f"[LEDGER DEBUG] live trading sync after placesmartorder rejection failed: {exc}"
+            )
         status_code = res.status if res and hasattr(res, "status") else 500
         return False, error_response, status_code
 

@@ -1,9 +1,12 @@
 # database/sandbox_db.py
 
 import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 from dotenv import load_dotenv
+from cachetools import TTLCache
 from sqlalchemy import (
     DECIMAL,
     Boolean,
@@ -16,14 +19,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    create_engine,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
-from sqlalchemy.pool import NullPool
-from sqlalchemy.sql import func
-
+from database.db import Base, Session, SessionLocal, engine
 from utils.logging import get_logger
+from utils.timezone import now_ist
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -33,21 +32,42 @@ load_dotenv()
 
 # Sandbox database URL - separate database for isolation
 # Get from environment variable or use default path in /db directory
-SANDBOX_DATABASE_URL = os.getenv("SANDBOX_DATABASE_URL", "sqlite:///db/sandbox.db")
+SANDBOX_DATABASE_URL = os.getenv("SANDBOX_DATABASE_URL", "")
+logger.info(f"[LEDGER DEBUG] Sandbox DB engine URL: {engine.url}")
+db_session = Session
 
-# Conditionally create engine based on DB type
-if SANDBOX_DATABASE_URL and "sqlite" in SANDBOX_DATABASE_URL:
-    # SQLite: Use NullPool to prevent connection pool exhaustion
-    engine = create_engine(
-        SANDBOX_DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
-    )
-else:
-    # For other databases like PostgreSQL, use connection pooling
-    engine = create_engine(SANDBOX_DATABASE_URL, pool_size=20, max_overflow=40, pool_timeout=10)
+_config_cache = TTLCache(
+    maxsize=128, ttl=int(os.getenv("SANDBOX_CONFIG_CACHE_TTL", "30"))
+)
+_config_cache_lock = threading.Lock()
 
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-Base = declarative_base()
-Base.query = db_session.query_property()
+
+@contextmanager
+def _session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _invalidate_config_cache():
+    with _config_cache_lock:
+        _config_cache.clear()
+
+
+def _get_cached_config(config_key):
+    with _config_cache_lock:
+        return _config_cache.get(config_key)
+
+
+def _set_cached_config(config_key, value):
+    with _config_cache_lock:
+        _config_cache[config_key] = value
 
 
 class SandboxOrders(Base):
@@ -77,19 +97,22 @@ class SandboxOrders(Base):
     margin_blocked = Column(
         DECIMAL(10, 2), nullable=True, default=0.00
     )  # Margin blocked at order placement
-    order_timestamp = Column(DateTime, nullable=False, default=func.now())
-    update_timestamp = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    order_timestamp = Column(DateTime(timezone=True), nullable=False, default=now_ist)
+    update_timestamp = Column(DateTime(timezone=True), nullable=False, default=now_ist, onupdate=now_ist)
 
     __table_args__ = (
-        Index("idx_user_status", "user_id", "order_status"),
-        Index("idx_symbol_exchange", "symbol", "exchange"),
+        Index("idx_sandbox_user_status", "user_id", "order_status"),
+        Index("idx_sandbox_symbol_exchange", "symbol", "exchange"),
         CheckConstraint(
             "order_status IN ('open', 'complete', 'cancelled', 'rejected')",
-            name="check_order_status",
+            name="sandbox_check_order_status",
         ),
-        CheckConstraint("action IN ('BUY', 'SELL')", name="check_action"),
-        CheckConstraint("price_type IN ('MARKET', 'LIMIT', 'SL', 'SL-M')", name="check_price_type"),
-        CheckConstraint("product IN ('CNC', 'NRML', 'MIS')", name="check_product"),
+        CheckConstraint("action IN ('BUY', 'SELL')", name="sandbox_check_action"),
+        CheckConstraint(
+            "price_type IN ('MARKET', 'LIMIT', 'SL', 'SL-M')",
+            name="sandbox_check_price_type",
+        ),
+        CheckConstraint("product IN ('CNC', 'NRML', 'MIS')", name="sandbox_check_product"),
     )
 
 
@@ -109,11 +132,11 @@ class SandboxTrades(Base):
     price = Column(DECIMAL(10, 2), nullable=False)  # Execution price
     product = Column(String(20), nullable=False)  # CNC, NRML, MIS
     strategy = Column(String(100), nullable=True)
-    trade_timestamp = Column(DateTime, nullable=False, default=func.now())
+    trade_timestamp = Column(DateTime(timezone=True), nullable=False, default=now_ist)
 
     __table_args__ = (
-        Index("idx_user_symbol", "user_id", "symbol"),
-        Index("idx_orderid", "orderid"),
+        Index("idx_sandbox_user_symbol", "user_id", "symbol"),
+        Index("idx_sandbox_orderid", "orderid"),
     )
 
 
@@ -148,12 +171,14 @@ class SandboxPositions(Base):
     margin_blocked = Column(DECIMAL(15, 2), default=0.00)  # Total margin blocked for this position
 
     # Timestamps
-    created_at = Column(DateTime, nullable=False, default=func.now())
-    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, default=now_ist)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=now_ist, onupdate=now_ist)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "symbol", "exchange", "product", name="unique_position"),
-        Index("idx_user_product", "user_id", "product"),
+        UniqueConstraint(
+            "user_id", "symbol", "exchange", "product", name="unique_sandbox_position"
+        ),
+        Index("idx_sandbox_user_product", "user_id", "product"),
     )
 
 
@@ -178,10 +203,12 @@ class SandboxHoldings(Base):
     settlement_date = Column(Date, nullable=False)  # Date when position was settled to holdings
 
     # Timestamps
-    created_at = Column(DateTime, nullable=False, default=func.now())
-    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, default=now_ist)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=now_ist, onupdate=now_ist)
 
-    __table_args__ = (UniqueConstraint("user_id", "symbol", "exchange", name="unique_holding"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "symbol", "exchange", name="unique_sandbox_holding"),
+    )
 
 
 class SandboxFunds(Base):
@@ -208,12 +235,12 @@ class SandboxFunds(Base):
     total_pnl = Column(DECIMAL(15, 2), default=0.00)  # Total P&L (realized + unrealized)
 
     # Reset tracking
-    last_reset_date = Column(DateTime, nullable=False, default=func.now())
+    last_reset_date = Column(DateTime(timezone=True), nullable=False, default=now_ist)
     reset_count = Column(Integer, default=0)  # Number of times reset has occurred
 
     # Timestamps
-    created_at = Column(DateTime, nullable=False, default=func.now())
-    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, default=now_ist)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=now_ist, onupdate=now_ist)
 
 
 class SandboxDailyPnL(Base):
@@ -241,11 +268,11 @@ class SandboxDailyPnL(Base):
     portfolio_value = Column(DECIMAL(15, 2), default=0.00)  # Total value including positions
 
     # Metadata
-    created_at = Column(DateTime, nullable=False, default=func.now())
+    created_at = Column(DateTime(timezone=True), nullable=False, default=now_ist)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "date", name="unique_user_daily_pnl"),
-        Index("idx_user_date", "user_id", "date"),
+        UniqueConstraint("user_id", "date", name="unique_sandbox_user_daily_pnl"),
+        Index("idx_sandbox_user_date", "user_id", "date"),
     )
 
 
@@ -258,17 +285,25 @@ class SandboxConfig(Base):
     config_key = Column(String(100), unique=True, nullable=False, index=True)
     config_value = Column(Text, nullable=False)
     description = Column(Text, nullable=True)
-    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=now_ist, onupdate=now_ist)
 
 
-def init_db():
+def init_sandbox_db():
     """Initialize sandbox database and tables"""
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Sandbox DB", logger)
+    logger.info(
+        "Sandbox DB initialized — tables: sandbox_orders, sandbox_trades, sandbox_positions, sandbox_holdings, sandbox_funds, sandbox_daily_pnl, sandbox_config"
+    )
 
     # Initialize default configuration
     init_default_config()
+
+
+def init_db():
+    """Backward-compatible alias for sandbox DB initialization."""
+    init_sandbox_db()
 
 
 def init_default_config():
@@ -368,29 +403,40 @@ def init_default_config():
         },
     ]
 
-    for config in default_configs:
-        try:
-            existing = SandboxConfig.query.filter_by(config_key=config["config_key"]).first()
-            if not existing:
-                config_obj = SandboxConfig(**config)
-                db_session.add(config_obj)
-                db_session.commit()
-                logger.debug(f"Added default config: {config['config_key']}")
-        except IntegrityError:
-            db_session.rollback()
-            logger.debug(f"Config already exists: {config['config_key']}")
-        except Exception as e:
-            db_session.rollback()
-            logger.exception(f"Error adding config {config['config_key']}: {e}")
+    try:
+        with _session_scope() as session:
+            existing_keys = {
+                row[0]
+                for row in session.query(SandboxConfig.config_key)
+                .filter(SandboxConfig.config_key.in_([cfg["config_key"] for cfg in default_configs]))
+                .all()
+            }
+
+            missing = [SandboxConfig(**cfg) for cfg in default_configs if cfg["config_key"] not in existing_keys]
+            if missing:
+                session.add_all(missing)
+                logger.debug(f"Added {len(missing)} default sandbox config row(s)")
+    except IntegrityError:
+        logger.debug("Sandbox config defaults already exist")
+    except Exception as e:
+        logger.exception(f"Error initializing sandbox defaults: {e}")
+    finally:
+        _invalidate_config_cache()
 
 
 def get_config(config_key, default=None):
     """Get configuration value by key"""
     try:
-        config = SandboxConfig.query.filter_by(config_key=config_key).first()
-        if config:
-            return config.config_value
-        return default
+        cached = _get_cached_config(config_key)
+        if cached is not None:
+            return cached
+
+        with SessionLocal() as session:
+            config = session.query(SandboxConfig).filter_by(config_key=config_key).first()
+            if config:
+                _set_cached_config(config_key, config.config_value)
+                return config.config_value
+            return default
     except Exception as e:
         logger.exception(f"Error fetching config {config_key}: {e}")
         return default
@@ -399,21 +445,21 @@ def get_config(config_key, default=None):
 def set_config(config_key, config_value, description=None):
     """Set configuration value"""
     try:
-        config = SandboxConfig.query.filter_by(config_key=config_key).first()
-        if config:
-            config.config_value = str(config_value)
-            if description:
-                config.description = description
-        else:
-            config = SandboxConfig(
-                config_key=config_key, config_value=str(config_value), description=description
-            )
-            db_session.add(config)
-        db_session.commit()
+        with _session_scope() as session:
+            config = session.query(SandboxConfig).filter_by(config_key=config_key).first()
+            if config:
+                config.config_value = str(config_value)
+                if description:
+                    config.description = description
+            else:
+                config = SandboxConfig(
+                    config_key=config_key, config_value=str(config_value), description=description
+                )
+                session.add(config)
         logger.info(f"Updated config: {config_key} = {config_value}")
+        _set_cached_config(config_key, str(config_value))
         return True
     except Exception as e:
-        db_session.rollback()
         logger.exception(f"Error setting config {config_key}: {e}")
         return False
 
@@ -421,11 +467,16 @@ def set_config(config_key, config_value, description=None):
 def get_all_configs():
     """Get all configuration values"""
     try:
-        configs = SandboxConfig.query.all()
-        return {
-            config.config_key: {"value": config.config_value, "description": config.description}
-            for config in configs
-        }
+        with SessionLocal() as session:
+            configs = session.query(SandboxConfig).all()
+            result = {
+                config.config_key: {"value": config.config_value, "description": config.description}
+                for config in configs
+            }
+        with _config_cache_lock:
+            for key, value in result.items():
+                _config_cache[key] = value["value"]
+        return result
     except Exception as e:
         logger.exception(f"Error fetching all configs: {e}")
         return {}

@@ -64,7 +64,13 @@ services:
     environment:
       - FLASK_DEBUG=True
       - FLASK_ENV=development
-      - DATABASE_URL=sqlite:///db/openalgo.db
+      - ENV=local
+      - LOCAL_DB_HOST=host.docker.internal
+      - LOCAL_DB_PORT=5432
+      - LOCAL_DB_NAME=openalgo
+      - LOCAL_DB_USER=postgres
+      - LOCAL_DB_PASSWORD=postgres
+      - LOCAL_DB_SSLMODE=disable
     restart: unless-stopped
 ```
 
@@ -156,8 +162,8 @@ openalgo/
    * Check logs for errors after changes
 
 2. **Database Access:**
-   * SQLite database persists in ./db directory
-   * Can be accessed from both host and container
+   * PostgreSQL database is configured through `LOCAL_DB_*` / `PROD_DB_*`
+   * You can point the container at a host PostgreSQL server or a local Dockerized one
   
 3. **Debugging:**
    * Logs are printed to console
@@ -206,4 +212,3 @@ openalgo/
 
 ## Note
 This configuration is optimized for development. For production deployment, additional security measures and optimizations would be necessary.
-

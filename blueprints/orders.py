@@ -1,18 +1,29 @@
 import csv
 import io
 import os
+import threading
 from importlib import import_module
 
 from flask import Blueprint, Response, jsonify, redirect, render_template, request, session, url_for
 
 from database.auth_db import get_api_key_for_tradingview, get_auth_token
 from database.settings_db import get_analyze_mode
+from database.trading_db import (
+    mirror_live_order,
+    save_order,
+    save_order_event,
+    save_trade,
+    update_order_status,
+    upsert_holdings,
+    upsert_positions,
+)
 from limiter import limiter
 from services.close_position_service import close_position
 from services.holdings_service import get_holdings
 from services.orderbook_service import get_orderbook
 from services.place_smart_order_service import place_smart_order
 from services.positionbook_service import get_positionbook
+from services.trading_sync_service import sync_live_trading_state
 from services.tradebook_service import get_tradebook
 from utils.logging import get_logger
 from utils.session import check_session_validity
@@ -153,6 +164,126 @@ def generate_positions_csv(positions_data):
     return output.getvalue()
 
 
+def _queue_live_trading_sync(api_key: str | None, reason: str) -> None:
+    """Best-effort background sync for live-trading mirror tables."""
+    if not api_key:
+        return
+
+    threading.Thread(
+        target=sync_live_trading_state,
+        args=(api_key, reason),
+        daemon=True,
+        name=f"LiveTradingSync:{reason}",
+    ).start()
+
+
+def _persist_live_orderbook(order_data: list[dict], login_username: str, broker: str) -> None:
+    """Persist live orderbook data directly into PostgreSQL."""
+    try:
+        logger.info(
+            "[LEDGER DEBUG] blueprint orderbook persist start: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(order_data or []),
+        )
+        for order in order_data or []:
+            if not isinstance(order, dict):
+                continue
+
+            broker_order_id = (
+                order.get("broker_order_id")
+                or order.get("orderid")
+                or order.get("order_id")
+            )
+            if not broker_order_id:
+                continue
+
+            mirror_live_order(
+                order_data=order,
+                broker=broker,
+                api_key=None,
+                broker_order_id=str(broker_order_id),
+                order_status=order.get("order_status") or order.get("status") or "open",
+                broker_response=order,
+                user_id=login_username,
+                api_source="orderbook",
+            )
+        logger.info(
+            "[LEDGER DEBUG] blueprint orderbook persist finished: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(order_data or []),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to persist live orderbook mirror: {exc}")
+
+
+def _persist_live_tradebook(trade_data: list[dict], login_username: str, broker: str) -> None:
+    """Persist live tradebook data directly into PostgreSQL."""
+    try:
+        logger.info(
+            "[LEDGER DEBUG] blueprint tradebook persist start: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(trade_data or []),
+        )
+        for trade in trade_data or []:
+            if not isinstance(trade, dict):
+                continue
+            payload = trade.copy()
+            payload["user_id"] = login_username
+            payload["broker"] = broker
+            save_trade(payload)
+        logger.info(
+            "[LEDGER DEBUG] blueprint tradebook persist finished: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(trade_data or []),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to persist live tradebook mirror: {exc}")
+
+
+def _persist_live_positions(positions_data: list[dict], login_username: str, broker: str) -> None:
+    """Persist live positions directly into PostgreSQL."""
+    try:
+        logger.info(
+            "[LEDGER DEBUG] blueprint positions persist start: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(positions_data or []),
+        )
+        upsert_positions(login_username, broker, positions_data or [])
+        logger.info(
+            "[LEDGER DEBUG] blueprint positions persist finished: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(positions_data or []),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to persist live positions mirror: {exc}")
+
+
+def _persist_live_holdings(holdings_data: list[dict], login_username: str, broker: str) -> None:
+    """Persist live holdings directly into PostgreSQL."""
+    try:
+        logger.info(
+            "[LEDGER DEBUG] blueprint holdings persist start: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(holdings_data or []),
+        )
+        upsert_holdings(login_username, broker, holdings_data or [])
+        logger.info(
+            "[LEDGER DEBUG] blueprint holdings persist finished: user=%s broker=%s rows=%s",
+            login_username,
+            broker,
+            len(holdings_data or []),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to persist live holdings mirror: {exc}")
+
+
 @orders_bp.route("/orderbook")
 @check_session_validity
 @limiter.limit(API_RATE_LIMIT)
@@ -174,13 +305,15 @@ def orderbook():
         # Get API key for sandbox mode
         api_key = get_api_key_for_tradingview(login_username)
         if api_key:
-            success, response, status_code = get_orderbook(api_key=api_key)
+            success, response, status_code = get_orderbook(api_key=api_key, user_id=login_username)
         else:
             logger.error("No API key found for analyze mode")
             return "API key required for analyze mode", 400
     else:
         # Use live broker
-        success, response, status_code = get_orderbook(auth_token=auth_token, broker=broker)
+        success, response, status_code = get_orderbook(
+            auth_token=auth_token, broker=broker, user_id=login_username
+        )
 
     if not success:
         logger.error(f"Failed to get orderbook data: {response.get('message', 'Unknown error')}")
@@ -191,6 +324,11 @@ def orderbook():
     data = response.get("data", {})
     order_data = data.get("orders", [])
     order_stats = data.get("statistics", {})
+
+    if not get_analyze_mode():
+        _persist_live_orderbook(order_data, login_username, broker)
+        api_key = get_api_key_for_tradingview(login_username)
+        _queue_live_trading_sync(api_key, "blueprint.orderbook")
 
     return render_template("orderbook.html", order_data=order_data, order_stats=order_stats)
 
@@ -216,13 +354,17 @@ def tradebook():
         # Get API key for sandbox mode
         api_key = get_api_key_for_tradingview(login_username)
         if api_key:
-            success, response, status_code = get_tradebook(api_key=api_key)
+            success, response, status_code = get_tradebook(
+                api_key=api_key, user_id=login_username
+            )
         else:
             logger.error("No API key found for analyze mode")
             return "API key required for analyze mode", 400
     else:
         # Use live broker
-        success, response, status_code = get_tradebook(auth_token=auth_token, broker=broker)
+        success, response, status_code = get_tradebook(
+            auth_token=auth_token, broker=broker, user_id=login_username
+        )
 
     if not success:
         logger.error(f"Failed to get tradebook data: {response.get('message', 'Unknown error')}")
@@ -231,6 +373,11 @@ def tradebook():
         return redirect(url_for("auth.logout"))
 
     tradebook_data = response.get("data", [])
+
+    if not get_analyze_mode():
+        _persist_live_tradebook(tradebook_data, login_username, broker)
+        api_key = get_api_key_for_tradingview(login_username)
+        _queue_live_trading_sync(api_key, "blueprint.tradebook")
 
     return render_template("tradebook.html", tradebook_data=tradebook_data)
 
@@ -256,13 +403,17 @@ def positions():
         # Get API key for sandbox mode
         api_key = get_api_key_for_tradingview(login_username)
         if api_key:
-            success, response, status_code = get_positionbook(api_key=api_key)
+            success, response, status_code = get_positionbook(
+                api_key=api_key, user_id=login_username
+            )
         else:
             logger.error("No API key found for analyze mode")
             return "API key required for analyze mode", 400
     else:
         # Use live broker
-        success, response, status_code = get_positionbook(auth_token=auth_token, broker=broker)
+        success, response, status_code = get_positionbook(
+            auth_token=auth_token, broker=broker, user_id=login_username
+        )
 
     if not success:
         logger.error(f"Failed to get positions data: {response.get('message', 'Unknown error')}")
@@ -271,6 +422,11 @@ def positions():
         return redirect(url_for("auth.logout"))
 
     positions_data = response.get("data", [])
+
+    if not get_analyze_mode():
+        _persist_live_positions(positions_data, login_username, broker)
+        api_key = get_api_key_for_tradingview(login_username)
+        _queue_live_trading_sync(api_key, "blueprint.positions")
 
     return render_template("positions.html", positions_data=positions_data)
 
@@ -296,13 +452,17 @@ def holdings():
         # Get API key for sandbox mode
         api_key = get_api_key_for_tradingview(login_username)
         if api_key:
-            success, response, status_code = get_holdings(api_key=api_key)
+            success, response, status_code = get_holdings(
+                api_key=api_key, user_id=login_username
+            )
         else:
             logger.error("No API key found for analyze mode")
             return "API key required for analyze mode", 400
     else:
         # Use live broker
-        success, response, status_code = get_holdings(auth_token=auth_token, broker=broker)
+        success, response, status_code = get_holdings(
+            auth_token=auth_token, broker=broker, user_id=login_username
+        )
 
     if not success:
         logger.error(f"Failed to get holdings data: {response.get('message', 'Unknown error')}")
@@ -313,6 +473,11 @@ def holdings():
     data = response.get("data", {})
     holdings_data = data.get("holdings", [])
     portfolio_stats = data.get("statistics", {})
+
+    if not get_analyze_mode():
+        _persist_live_holdings(holdings_data, login_username, broker)
+        api_key = get_api_key_for_tradingview(login_username)
+        _queue_live_trading_sync(api_key, "blueprint.holdings")
 
     return render_template(
         "holdings.html", holdings_data=holdings_data, portfolio_stats=portfolio_stats
@@ -337,7 +502,9 @@ def export_orderbook():
             # Get API key for sandbox mode
             api_key = get_api_key_for_tradingview(login_username)
             if api_key:
-                success, response, status_code = get_orderbook(api_key=api_key)
+                success, response, status_code = get_orderbook(
+                    api_key=api_key, user_id=login_username
+                )
                 if not success:
                     logger.error("Failed to get orderbook data in analyze mode")
                     return "Error getting orderbook data", 500
@@ -398,7 +565,9 @@ def export_tradebook():
             # Get API key for sandbox mode
             api_key = get_api_key_for_tradingview(login_username)
             if api_key:
-                success, response, status_code = get_tradebook(api_key=api_key)
+                success, response, status_code = get_tradebook(
+                    api_key=api_key, user_id=login_username
+                )
                 if not success:
                     logger.error("Failed to get tradebook data in analyze mode")
                     return "Error getting tradebook data", 500
@@ -458,7 +627,9 @@ def export_positions():
             # Get API key for sandbox mode
             api_key = get_api_key_for_tradingview(login_username)
             if api_key:
-                success, response, status_code = get_positionbook(api_key=api_key)
+                success, response, status_code = get_positionbook(
+                    api_key=api_key, user_id=login_username
+                )
                 if not success:
                     logger.error("Failed to get positions data in analyze mode")
                     return "Error getting positions data", 500
@@ -603,6 +774,41 @@ def close_position():
                 "orderid": orderid,
             }
             status_code = 200
+
+            try:
+                local_order_id = save_order(
+                    {
+                        "user_id": login_username,
+                        "broker": broker_name,
+                        "strategy": "UI Exit Position",
+                        "broker_order_id": str(orderid),
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "action": "BUY",
+                        "quantity": data.get("quantity", 0) or 0,
+                        "price": data.get("price", 0) or 0,
+                        "trigger_price": data.get("trigger_price", 0) or 0,
+                        "pricetype": "MARKET",
+                        "product": product,
+                        "order_status": "open",
+                        "placed_at": None,
+                        "updated_at": None,
+                        "order_type": "live",
+                        "api_source": "closeposition",
+                    }
+                )
+                if local_order_id:
+                    save_order_event(
+                        local_order_id,
+                        "submitted",
+                        data.get("quantity", 0) or 0,
+                        data.get("price", 0) or 0,
+                        response or {},
+                    )
+            except Exception as mirror_error:
+                logger.warning(
+                    f"Close-position order mirror failed (non-critical): {mirror_error}"
+                )
 
             # Publish event for logging, socketio, and telegram (fixes missing API log)
             api_key = get_api_key_for_tradingview(login_username)
